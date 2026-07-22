@@ -1,0 +1,1 @@
+@AGENTS.zh-CN.md
