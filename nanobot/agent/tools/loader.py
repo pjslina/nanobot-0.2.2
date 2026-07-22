@@ -1,4 +1,10 @@
-"""Tool discovery and registration via package scanning."""
+"""Tool discovery and registration via package scanning.
+
+工具的"自动发现与注册"。nanobot 不硬编码工具列表，而是：
+1. 用 pkgutil 扫描 nanobot.agent.tools 包下所有模块，找出 Tool 的非抽象子类并实例化注册；
+2. 通过 entry_points（group="nanobot.tools"）发现外部插件包提供的工具。
+这样内置工具与第三方插件都能被自动加载，无需修改核心代码。
+"""
 from __future__ import annotations
 
 import importlib
@@ -11,6 +17,7 @@ from loguru import logger
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 
+# 扫描时跳过的模块：这些是基础设施/基类模块，本身不提供具体工具。
 _SKIP_MODULES = frozenset({
     "base", "schema", "registry", "context", "loader", "config",
     "file_state", "sandbox", "mcp", "__init__", "runtime_state",
@@ -23,11 +30,12 @@ class ToolLoader:
             import nanobot.agent.tools as _pkg
             package = _pkg
         self._package = package
-        self._test_classes = test_classes
+        self._test_classes = test_classes  # 测试时可注入固定的工具类列表
         self._discovered: list[type[Tool]] | None = None
         self._plugins: dict[str, type[Tool]] | None = None
 
     def discover(self) -> list[type[Tool]]:
+        # 扫描包内模块，发现所有可实例化的 Tool 子类。结果缓存，按类名排序保证稳定。
         if self._test_classes is not None:
             return list(self._test_classes)
         if self._discovered is not None:
@@ -44,6 +52,7 @@ class ToolLoader:
                 continue
             for attr_name in dir(module):
                 attr = getattr(module, attr_name)
+                # 收集条件：是 Tool 的非抽象子类、非下划线开头、未被 _plugin_discoverable 禁用、未重复。
                 if (
                     isinstance(attr, type)
                     and issubclass(attr, Tool)
@@ -60,7 +69,10 @@ class ToolLoader:
         return results
 
     def _discover_plugins(self) -> dict[str, type[Tool]]:
-        """Discover external tool plugins registered via entry_points."""
+        """Discover external tool plugins registered via entry_points.
+
+        通过 entry_points（group="nanobot.tools"）发现外部插件包注册的工具。
+        """
         if self._plugins is not None:
             return self._plugins
         plugins: dict[str, type[Tool]] = {}
@@ -84,6 +96,8 @@ class ToolLoader:
         return plugins
 
     def load(self, ctx: Any, registry: ToolRegistry, *, scope: str = "core") -> list[str]:
+        # 加载并注册所有工具：先内置（discover），后插件（entry_points）。
+        # 插件与内置工具同名时，插件被跳过（内置优先）。返回已注册的工具名列表。
         registered: list[str] = []
         builtin_names: set[str] = set()
         sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
@@ -92,12 +106,13 @@ class ToolLoader:
                 cls_label = tool_cls.__name__
                 try:
                     if scope not in getattr(tool_cls, "_scopes", {"core"}):
-                        continue
+                        continue  # 工具声明的作用域不含当前 scope，跳过
                     if not tool_cls.enabled(ctx):
-                        continue
+                        continue  # 工具在当前配置下未启用，跳过
                     tool = tool_cls.create(ctx)
                     if registry.has(tool.name):
                         if is_plugin_source and tool.name in builtin_names:
+                            # 插件与内置工具同名：跳过插件，内置优先。
                             logger.warning(
                                 "Plugin %s skipped: conflicts with built-in tool %s",
                                 cls_label, tool.name,

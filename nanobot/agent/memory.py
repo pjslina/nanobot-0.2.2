@@ -1,4 +1,15 @@
-"""Memory system: pure file I/O store and lightweight Consolidator."""
+"""Memory system: pure file I/O store and lightweight Consolidator.
+
+记忆系统在整体架构中的职责：
+- ``MemoryStore``：纯文件 I/O 层，负责 MEMORY.md / history.jsonl / SOUL.md / USER.md
+  的读写、历史游标（cursor）分配、原子落盘（write-to-tmp + fsync + rename）以及
+  旧版 HISTORY.md 迁移。history.jsonl 为追加式 JSONL，每条记录带单调自增 cursor。
+- ``Consolidator``：按 token 预算触发的轻量巩固器，把活跃会话中被淘汰的旧消息
+  交由 LLM 摘要后写入 history.jsonl，从而控制上下文窗口占用。
+- Dream 两阶段记忆巩固：``build_dream_prompt`` / ``build_dream_tools`` 构造一个
+  临时 agent，阶段1读取自上次 dream cursor 以来未处理的历史并生成提示词，
+  阶段2由该 agent 用受限工具重写 MEMORY.md / 技能等长期记忆文件并提交。
+"""
 
 from __future__ import annotations
 
@@ -39,7 +50,12 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
-    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
+    """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md.
+
+    纯文件 I/O 层：不涉及任何 LLM 调用，只负责记忆文件读写、历史游标分配、
+    原子落盘与旧格式迁移。history.jsonl 采用追加式 JSONL，每条记录携带单调
+    自增的 ``cursor`` 字段，供 Dream 巩固与会话回放定位增量。
+    """
 
     _DEFAULT_MAX_HISTORY = 1000
     _INTERNAL_HISTORY_SESSION_PREFIXES = ("cron:", "dream:")
@@ -64,7 +80,7 @@ class MemoryStore:
         self._corruption_logged = False  # rate-limit invalid cursor warning
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
-        self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        self._append_lock = threading.Lock()  # 序列化游标分配+追加，保证并发写不产生重复 cursor
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -88,6 +104,9 @@ class MemoryStore:
 
         The migration is best-effort and prioritizes preserving as much content
         as possible over perfect parsing.
+
+        一次性迁移：将旧版 HISTORY.md 解析为 JSONL。迁移后把 dream cursor 也置为
+        末尾，避免首次启动时把全部历史重放到 Dream 中。
         """
         if not self.legacy_history_file.exists():
             return
@@ -256,6 +275,10 @@ class MemoryStore:
         applied as a final safety net: individual callers should cap their own
         content more tightly; this default only exists to catch unintentional
         large writes (e.g. an LLM echoing its input back as a "summary").
+
+        追加一条历史记录并返回其自增 cursor。先经 ``strip_think`` 剥离模板泄露
+        （未闭合的 ``<think``、``<channel|>`` 标记等），再做硬上限截断。游标分配
+        与文件追加在同一把锁内原子完成，避免并发写产生重复游标。
         """
         limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -273,6 +296,8 @@ class MemoryStore:
         content = strip_think(raw)
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
+        # 游标分配与文件追加必须在同一把锁内原子完成：否则并发写线程会读到
+        # 相同的当前 cursor，写出重复游标。
         with self._append_lock:
             cursor = self._next_cursor()
             if raw and not content:
@@ -347,7 +372,12 @@ class MemoryStore:
         return None
 
     def _next_cursor(self) -> int:
-        """Read the current cursor counter and return the next value."""
+        """Read the current cursor counter and return the next value.
+
+        读取当前 cursor 计数器并返回下一个值。优先信任持久化计数器与文件末尾
+        游标的较大者；若两者都不可用则回退到全表扫描取 max，即使外部写入破坏了
+        单调性也能恢复正确（代价是 O(n) 扫描）。
+        """
         cursor_counter = self._read_cursor_counter()
         last = self._read_last_entry() or {}
         last_cursor = self._valid_cursor(last.get("cursor"))
@@ -360,6 +390,7 @@ class MemoryStore:
         # Fast path: trust the tail when intact.  Otherwise scan the whole
         # file and take ``max`` — that stays correct even if the monotonic
         # invariant was broken by external writes.
+        # 快速路径：尾部完好时直接信任；否则全表扫描取 max，仍能保持正确性。
         if last_cursor is not None:
             return last_cursor + 1
         return max((c for _, c in self._iter_valid_entries()), default=0) + 1
@@ -444,20 +475,27 @@ class MemoryStore:
             return None
 
     def _write_entries(self, entries: list[dict[str, Any]]) -> None:
-        """Overwrite history.jsonl with the given entries (atomic write)."""
+        """Overwrite history.jsonl with the given entries (atomic write).
+
+        原子覆写 history.jsonl：先写临时文件并 ``fsync`` 刷盘，再 ``os.replace``
+        原子替换目标文件，最后对目录做 ``fsync`` 以确保持久化（崩溃安全）。
+        任何异常都清理临时文件后向上抛出。
+        """
         tmp_path = self.history_file.with_suffix(self.history_file.suffix + ".tmp")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 for entry in entries:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self.history_file)
+                os.fsync(f.fileno())  # 刷盘文件内容，保证数据落盘
+            os.replace(tmp_path, self.history_file)  # 原子替换，避免半写状态
 
             # fsync the directory so the rename is durable.
             # On Windows, opening a directory with O_RDONLY raises
             # PermissionError — skip the dir sync there (NTFS
             # journals metadata synchronously).
+            # 对目录 fsync 使重命名操作也持久化；Windows 上打开目录会抛
+            # PermissionError，故跳过（NTFS 会同步记录元数据日志）。
             with suppress(PermissionError):
                 fd = os.open(str(self.history_file.parent), os.O_RDONLY)
                 try:
@@ -483,6 +521,10 @@ class MemoryStore:
         """Build the Dream prompt with unprocessed history context.
 
         Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
+
+        Dream 阶段1：读取自上次 dream cursor 以来未处理的历史条目，拼装成提示词
+        交由临时 Dream agent 处理（阶段2 由该 agent 重写长期记忆文件）。
+        返回 ``(提示词, 本批末尾 cursor)``；无新内容时返回 ``None``。
         """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
@@ -504,7 +546,12 @@ class MemoryStore:
         return (prompt, batch[-1]["cursor"])
 
     def build_dream_tools(self):
-        """Build the restricted tool registry used by Dream runs."""
+        """Build the restricted tool registry used by Dream runs.
+
+        构造 Dream 专用受限工具集：仅允许读取工作区、编辑 skills 目录，以及对
+        MEMORY.md / SOUL.md / USER.md 这几个长期记忆文件做编辑/打补丁/写入。
+        防止 Dream agent 越权修改其它文件。
+        """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.apply_patch import ApplyPatchTool
         from nanobot.agent.tools.file_state import FileStates
@@ -636,7 +683,13 @@ _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 
 class Consolidator:
-    """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
+    """Lightweight consolidation: summarizes evicted messages into history.jsonl.
+
+    轻量巩固器：当会话提示词 token 超过安全预算时，把活跃会话中被淘汰的旧消息
+    交由 LLM 摘要后写入 history.jsonl，并在会话上推进 ``last_consolidated`` 游标。
+    巩固按"用户回合边界"切分，避免在工具调用中间断开造成非法消息序列。每个会话
+    有独立的 asyncio 锁，防止并发巩固互相覆盖。
+    """
 
     _MAX_CONSOLIDATION_ROUNDS = 5
 
@@ -681,7 +734,11 @@ class Consolidator:
         self.max_completion_tokens = provider.generation.max_tokens
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
-        """Return the shared consolidation lock for one session."""
+        """Return the shared consolidation lock for one session.
+
+        返回某会话专属的巩固锁。使用 WeakValueDictionary 存储，会话不活跃时
+        锁对象可被回收，避免长期持有无用锁。同一会话的并发巩固串行化执行。
+        """
         return self._locks.setdefault(session_key, asyncio.Lock())
 
     def pick_consolidation_boundary(
@@ -689,7 +746,12 @@ class Consolidator:
         session: Session,
         tokens_to_remove: int,
     ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
+        """Pick a user-turn boundary that removes enough old prompt tokens.
+
+        选择一个"用户回合边界"作为巩固切分点：从 ``last_consolidated`` 起向后扫描，
+        仅在遇到新的 user 消息时才候选切分，确保被归档的块不会切断工具调用序列。
+        返回 ``(边界索引, 已移除 token 数)``，找不到足够大的安全边界时返回 ``None``。
+        """
         start = session.last_consolidated
         if start >= len(session.messages) or tokens_to_remove <= 0:
             return None
@@ -819,7 +881,11 @@ class Consolidator:
 
     @property
     def _input_token_budget(self) -> int:
-        """Available input token budget for consolidation LLM."""
+        """Available input token budget for consolidation LLM.
+
+        巩固用 LLM 的可用输入 token 预算 = 上下文窗口 - 最大补全 token - 安全余量。
+        安全余量用于吸收 tokenizer 估算漂移，避免请求超出上下文窗口。
+        """
         return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
 
     def _truncate_to_token_budget(self, text: str) -> str:
@@ -844,6 +910,10 @@ class Consolidator:
         messages in the summary without archiving them.
 
         Returns the summary text on success, None if nothing to archive.
+
+        核心 LLM 摘要归档：把待归档消息格式化后交给 LLM 生成摘要，写入 history.jsonl。
+        若 LLM 调用失败，回退到 ``raw_archive`` 原样转储，保证不丢消息。成功返回摘要
+        文本，无内容可归档时返回 ``None``。
         """
         if not messages:
             return None
@@ -890,6 +960,15 @@ class Consolidator:
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
+
+        巩固主循环（按 token 预算触发）：
+        1. 取会话专属锁，并刷新会话引用（AutoCompact 可能已替换它）；
+        2. 先做回放窗口溢出巩固（隐藏在回放窗口之外的消息归档）；
+        3. 估算当前提示词 token；未超预算则仅持久化摘要后返回；
+        4. 超预算时进入多轮巩固（最多 ``_MAX_CONSOLIDATION_ROUNDS`` 轮）：每轮选取
+           用户回合边界、归档旧块、推进 ``last_consolidated``、重新估算，直到 token
+           降到目标值（预算 × ``consolidation_ratio``）或无安全边界为止；
+        5. LLM 降级时立即停止本轮，避免反复冲击失败的 LLM。
         """
         if self.context_window_tokens <= 0:
             return
@@ -897,6 +976,7 @@ class Consolidator:
         lock = self.get_lock(session.key)
         async with lock:
             # Refresh session reference: AutoCompact may have replaced it.
+            # 刷新会话引用：AutoCompact 可能已用新对象替换缓存中的旧会话。
             fresh = self.sessions.get_or_create(session.key)
             if fresh is not session:
                 session = fresh
@@ -904,7 +984,7 @@ class Consolidator:
                 return
 
             budget = self._input_token_budget
-            target = int(budget * self.consolidation_ratio)
+            target = int(budget * self.consolidation_ratio)  # 巩固目标：预算 × 比例，留出余量
             last_summary = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
@@ -965,6 +1045,8 @@ class Consolidator:
                 # summarized; on failure archive() already raw-archived it as
                 # a breadcrumb. Re-archiving the same chunk on the next call
                 # would just emit duplicate [RAW] entries.
+                # 无论成功与否都推进游标：成功则块已摘要；失败则 archive() 已原样
+                # 转储为面包屑。下次再归档同一块只会产生重复 [RAW] 记录。
                 if summary:
                     last_summary = summary
                 session.last_consolidated = end_idx

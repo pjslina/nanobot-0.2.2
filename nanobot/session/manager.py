@@ -1,4 +1,15 @@
-"""Session management for conversation history."""
+"""Session management for conversation history.
+
+会话历史管理：每个会话（Session）保存一段连续对话的全部消息，
+以 JSONL 文件持久化到工作区 sessions 目录（首行为元数据，其余每行一条消息）。
+
+核心概念：
+- ``last_consolidated``：已被"记忆巩固"（压缩成记忆摘要）的消息前缀数量；
+  ``get_history`` 只返回该前缀之后的"未巩固"消息作为 LLM 输入，
+  从而控制上下文长度。
+- 原子写入：``save`` 先写 .tmp 再 os.replace，可选 fsync 保证崩溃安全。
+- 容量上限：消息过多时归档旧前缀并裁剪（enforce_file_cap）。
+"""
 
 import json
 import os
@@ -25,13 +36,15 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
 
-FILE_MAX_MESSAGES = 2000
+FILE_MAX_MESSAGES = 2000  # 单会话文件消息数硬上限，超过则归档裁剪
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
 _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
 _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
+# fork 会话时丢弃的"易变"元数据键（目标状态、待处理回合、检查点、标题等），
+# 这些与原会话的运行时状态绑定，分叉后的新会话不应继承。
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -100,17 +113,18 @@ def _metadata_title(metadata: Any) -> str:
 
 @dataclass
 class Session:
-    """A conversation session."""
+    """A conversation session. 一段连续对话的会话。"""
 
-    key: str  # channel:chat_id
+    key: str  # channel:chat_id  # 会话唯一标识（通常为 渠道:chat_id）
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    last_consolidated: int = 0  # Number of messages already consolidated to files  # 已被记忆巩固（压缩成摘要）的消息数量；get_history 只返回其后未巩固的消息
 
     def __post_init__(self) -> None:
-        # An out-of-range offset (corrupt metadata) would hide all history; reset it.
+        # 若 last_consolidated 越界或类型异常（元数据损坏），直接重置为 0，
+        # 否则会把全部历史错误地当作"已巩固"而隐藏。
         if (
             isinstance(self.last_consolidated, bool)
             or not isinstance(self.last_consolidated, int)
@@ -158,6 +172,11 @@ class Session:
     ) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input.
 
+        返回未巩固的消息作为 LLM 输入。
+        先按消息数（max_messages）从尾部切片，再按 token 预算（max_tokens）从尾部裁剪。
+        会尽量让切片从一个合法边界开始（用户消息开头、非孤立的工具结果），
+        避免把"半截 turn"喂给 LLM。
+
         History is sliced by message count first (``max_messages``), then by
         token budget from the tail (``max_tokens``) when provided.
         """
@@ -170,8 +189,8 @@ class Session:
         )
         sliced = unconsolidated[start_idx:]
 
-        # Avoid starting mid-turn when possible, except for proactive
-        # assistant deliveries that the user may be replying to.
+        # 尽量不从 turn 中间开始；但若是 agent 主动投递的消息（用户随后才回复），
+        # 允许把它包含进来以保留上下文。
         for i, message in enumerate(sliced):
             if message.get("role") == "user":
                 start = i
@@ -180,7 +199,7 @@ class Session:
                 sliced = sliced[start:]
                 break
 
-        # Drop orphan tool results at the front.
+        # 丢弃开头的"孤立工具结果"（没有对应工具调用在前），这类消息会让 LLM 困惑。
         start = find_legal_message_start(sliced)
         if start:
             sliced = sliced[start:]
@@ -255,6 +274,7 @@ class Session:
             out.append(entry)
 
         if max_tokens > 0 and out:
+            # 按 token 预算从尾部反向累加，超预算即停止，保留尽量新的合法历史。
             kept: list[dict[str, Any]] = []
             used = 0
             for message in reversed(out):
@@ -265,14 +285,13 @@ class Session:
                 used += tokens
             kept.reverse()
 
-            # Keep history aligned to the first visible user turn.
+            # 让历史对齐到第一个可见的用户 turn。
             first_user = next((i for i, m in enumerate(kept) if m.get("role") == "user"), None)
             if first_user is not None:
                 kept = kept[first_user:]
             else:
-                # Tight token budgets can otherwise leave assistant-only tails.
-                # If a user turn exists in the unsliced output, recover the
-                # nearest one even if it slightly exceeds the token budget.
+                # 紧张的 token 预算可能只留下 assistant 尾巴；
+                # 若未切片的输出里存在用户消息，即使略微超预算也恢复最近的一条。
                 recovered_user = next(
                     (i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"),
                     None,
@@ -280,7 +299,7 @@ class Session:
                 if recovered_user is not None:
                     kept = out[recovered_user:]
 
-            # And keep a legal tool-call boundary at the front.
+            # 开头保持合法的工具调用边界。
             start = find_legal_message_start(kept)
             if start:
                 kept = kept[start:]
@@ -302,6 +321,10 @@ class Session:
     ) -> tuple[list[dict], int]:
         """Keep a legal recent suffix, optionally extending it back to a user turn.
 
+        保留一个"合法的最近后缀"（用于裁剪过长会话），可选地向前扩展到一条用户消息。
+        返回 ``(dropped, already_consolidated_count)``：dropped 是被移除的消息（原顺序），
+        already_consolidated_count 是其中处于已巩固前缀内、因此无需再原始归档的数量。
+
         Returns ``(dropped, already_consolidated_count)`` where *dropped* is
         the list of removed messages (in original order) and
         *already_consolidated_count* is how many of those were inside the
@@ -309,6 +332,7 @@ class Session:
         raw archiving.
         """
         if max_messages <= 0:
+            # 0 表示清空：丢弃全部消息，已巩固计数取 min 防止越界。
             dropped = list(self.messages)
             lc = self.last_consolidated
             self.clear()
@@ -321,6 +345,7 @@ class Session:
 
         start_idx = max(0, len(self.messages) - max_messages)
         if extend_to_user:
+            # 向前回退到最近一条用户消息，保证不从 turn 中间截断。
             start_idx = next(
                 (i for i in range(start_idx, -1, -1) if self.messages[i].get("role") == "user"),
                 start_idx,
@@ -328,13 +353,13 @@ class Session:
 
         retained = self.messages[start_idx:]
 
-        # Prefer starting at a user turn when one exists within the retained window.
+        # 优先从保留窗口内的第一条用户消息开始。
         first_user = next((i for i, m in enumerate(retained) if m.get("role") == "user"), None)
         if first_user is not None:
             retained = retained[first_user:]
         elif not extend_to_user:
-            # If the hard-capped tail is assistant/tool-only, anchor to the
-            # latest user in the full session and take a capped forward window.
+            # 若硬截断的尾部只有 assistant/tool，则锚定到整段会话里最近一条用户消息，
+            # 取一个向前受限的窗口。
             latest_user = next(
                 (i for i in range(len(self.messages) - 1, -1, -1)
                  if self.messages[i].get("role") == "user"),
@@ -343,35 +368,31 @@ class Session:
             if latest_user is not None:
                 retained = self.messages[latest_user: latest_user + max_messages]
 
-        # Mirror get_history(): avoid persisting orphan tool results at the front.
+        # 与 get_history() 一致：不持久化开头的孤立工具结果。
         start = find_legal_message_start(retained)
         if start:
             retained = retained[start:]
 
-        # Hard-cap guarantee unless the caller requested user-turn extension.
+        # 除非调用方要求扩展到用户 turn，否则硬性保证不超过 max_messages。
         if not extend_to_user and len(retained) > max_messages:
             retained = retained[-max_messages:]
             start = find_legal_message_start(retained)
             if start:
                 retained = retained[start:]
 
-        # Compute actually-dropped messages using identity comparison so that
-        # even when retained is a non-contiguous slice of original (the else
-        # branch above), we never duplicate or lose messages.
+        # 用对象身份（id）比对来计算真正被丢弃的消息，这样即使 retained 是
+        # original 的非连续切片（上面的 else 分支），也不会重复或丢失消息。
         retained_ids = set(id(m) for m in retained)
         dropped = [m for m in original if id(m) not in retained_ids]
 
-        # Count how many dropped messages were in the already-consolidated
-        # prefix of the original list.  This cannot be a simple min() because
-        # dropped may include messages from *after* the consolidated prefix
-        # (e.g. in the else branch).
+        # 统计被丢弃的消息中有多少落在"已巩固前缀"内。不能简单用 min()，
+        # 因为 dropped 可能包含前缀之后的消息（如 else 分支）。
         already_consolidated = sum(
             1 for i, m in enumerate(original)
             if i < before_lc and id(m) not in retained_ids
         )
 
-        # New last_consolidated = count of retained messages that were inside
-        # the old consolidated prefix.
+        # 新的 last_consolidated = 保留下来、且原本就在已巩固前缀内的消息数。
         new_lc = sum(
             1 for i, m in enumerate(original)
             if i < before_lc and id(m) in retained_ids
@@ -411,18 +432,23 @@ class SessionManager:
     """
     Manages conversation sessions.
 
-    Sessions are stored as JSONL files in the sessions directory.
+    会话管理器：负责会话的加载、缓存、持久化与列举。
+    会话以 JSONL 文件存储在 sessions 目录（首行元数据，其余每行一条消息）。
+    内存中用 _cache 缓存已加载的会话，避免重复读盘。
     """
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
-        self._cache: dict[str, Session] = {}
+        self._cache: dict[str, Session] = {}  # 内存缓存：会话 key -> Session
 
     @staticmethod
     def safe_key(key: str) -> str:
-        """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
+        """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem.
+
+        把任意会话 key 映射成稳定的文件名 stem（HTTP 处理器使用）。
+        """
         return safe_filename(key.replace(":", "_"))
 
     def _get_session_path(self, key: str) -> Path:
@@ -574,6 +600,13 @@ class SessionManager:
     def save(self, session: Session, *, fsync: bool = False) -> None:
         """Save a session to disk atomically.
 
+        原子地保存会话到磁盘：先写 .tmp 临时文件，再 os.replace 重命名覆盖目标文件。
+        os.replace 是原子的，所以即使写到一半崩溃，也不会留下半截损坏的会话文件。
+
+        当 *fsync* 为 True 时，显式把文件及其父目录刷盘到持久存储。
+        默认关闭（正常情况下 OS 页缓存足够），但在优雅关闭时应开启，以免
+        启用回写缓存的文件系统（rclone VFS、NFS、FUSE 挂载等）丢失最近写入。
+
         When *fsync* is ``True`` the final file and its parent directory are
         explicitly flushed to durable storage.  This is intentionally off by
         default (the OS page-cache is sufficient for normal operation) but
@@ -586,6 +619,7 @@ class SessionManager:
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
+                # 首行写元数据记录（含 last_consolidated），其余每行一条消息。
                 metadata_line = {
                     "_type": "metadata",
                     "key": session.key,
@@ -601,6 +635,7 @@ class SessionManager:
                     f.flush()
                     os.fsync(f.fileno())
 
+            # 原子替换：把写好的临时文件重命名为正式文件。
             os.replace(tmp_path, path)
 
             if fsync:

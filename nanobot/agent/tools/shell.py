@@ -1,4 +1,8 @@
-"""Shell execution tool."""
+"""Shell execution tool.
+
+Shell 命令执行工具：将命令在受控环境（工作区边界、超时、沙箱、deny 列表）中执行，
+返回 stdout/stderr 与退出码。支持一次性执行和长任务会话两种模式。
+"""
 
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 # Policy note appended to recoverable workspace-boundary guard errors.
+# 工作区边界违反提示：明确告知模型这是策略边界而非瞬时故障，禁止用 shell 技巧绕过。
 _WORKSPACE_BOUNDARY_NOTE = (
     "\n\nNote: this is a hard policy boundary, not a transient failure. "
     "Do NOT retry with shell tricks (symlinks, base64 piping, alternative "
@@ -52,7 +57,10 @@ _WORKSPACE_BOUNDARY_NOTE = (
 
 
 class ExecToolConfig(Base):
-    """Shell exec tool configuration."""
+    """Shell exec tool configuration.
+
+    Shell 执行工具配置：启用开关、超时、PATH 调整、沙箱后端、允许/拒绝模式。
+    """
     enable: bool = True
     timeout: int = Field(default=60, ge=0)  # Hard timeout (s); 0 = no limit. Not capped by the per-call max.
     path_prepend: str = ""
@@ -65,6 +73,7 @@ class ExecToolConfig(Base):
 
 @dataclass(slots=True)
 class _PreparedCommand:
+    # 命令在真正 spawn 前被规范化后的中间结构：命令串、工作目录、环境、超时、shell 程序、是否登录 shell。
     command: str
     cwd: str
     env: dict[str, str]
@@ -129,7 +138,13 @@ class _PreparedCommand:
     )
 )
 class ExecTool(Tool):
-    """Tool to execute shell commands."""
+    """Tool to execute shell commands.
+
+    执行 shell 命令的工具。核心职责：
+    1. 校验并规范化命令（工作目录、超时、shell、PATH、沙箱包装）。
+    2. 对破坏性命令做尽力而为的安全拦截（deny 模式、路径穿越、内部 URL、工作区越界）。
+    3. 一次性执行返回输出；或通过 yield_time_ms 进入长任务会话模式（由 exec_session 管理）。
+    """
     _scopes = {"core", "subagent"}
 
     config_key = "exec"
@@ -189,6 +204,7 @@ class ExecTool(Tool):
             # Block writes to nanobot internal state files (#2989).
             # history.jsonl / .dream_cursor are managed by append_history();
             # direct writes corrupt the cursor format and crash /dream.
+            # 内部状态文件：禁止直接写 history.jsonl / .dream_cursor，否则会破坏游标格式并导致 /dream 崩溃。
             r">>?\s*\S*(?:history\.jsonl|\.dream_cursor)",            # > / >> redirect
             r"\btee\b[^|;&<>]*(?:history\.jsonl|\.dream_cursor)",     # tee / tee -a
             r"\b(?:cp|mv)\b(?:\s+[^\s|;&<>]+)+\s+\S*(?:history\.jsonl|\.dream_cursor)",  # cp/mv target
@@ -253,6 +269,8 @@ class ExecTool(Tool):
         max_output_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
+        # 命令入口：兼容 command/cmd、working_dir/workdir 等别名。
+        # 若指定 yield_time_ms，则进入会话模式（长任务），否则一次性执行并等待结束。
         command = command or cmd
         working_dir = working_dir or workdir
         if not command:
@@ -277,6 +295,7 @@ class ExecTool(Tool):
             )
 
             try:
+                # 等待命令完成；超时则强制杀进程，取消则杀进程并向上传播 CancelledError。
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
                     timeout=prepared.timeout,
@@ -302,6 +321,7 @@ class ExecTool(Tool):
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
 
+            # 超出字符上限时，保留首尾各一半，中间以截断提示替代，避免丢失关键上下文。
             max_len = clamp_session_int(max_output_chars, self._MAX_OUTPUT, 1000, MAX_OUTPUT_CHARS)
             if len(result) > max_len:
                 half = max_len // 2
@@ -322,6 +342,8 @@ class ExecTool(Tool):
         yield_time_ms: int | None,
         max_output_chars: int | None,
     ) -> str:
+        # 长任务会话模式：委托给 ExecSessionManager 启动可轮询/可写 stdin 的会话，
+        # 立即返回首段输出与 session_id，后续可用 write_stdin 工具继续交互。
         try:
             session_id, poll = await self._session_manager.start(
                 command=prepared.command,
@@ -346,10 +368,9 @@ class ExecTool(Tool):
     def _resolve_timeout(self, timeout: int | None) -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).
 
-        A per-call timeout supplied by the model stays capped at _MAX_TIMEOUT so
-        the LLM cannot request unbounded execution. The config-level default
-        (self.timeout) may exceed that cap, and 0 disables the limit entirely
-        for trusted long-running tasks (#3595).
+        解析有效硬超时（秒，None 表示无限制）。
+        模型每次调用传入的 timeout 被限制在 _MAX_TIMEOUT 内，防止 LLM 请求无界执行。
+        配置级默认值 self.timeout 可超过该上限；0 表示对可信长任务完全禁用超时。
         """
         if timeout:
             return min(timeout, self._MAX_TIMEOUT)
@@ -365,6 +386,8 @@ class ExecTool(Tool):
         shell: str | None = None,
         login: bool | None = None,
     ) -> _PreparedCommand | str:
+        # 命令预处理：解析工作区访问边界、校验工作目录不越界、执行安全守卫、
+        # 应用沙箱包装、解析超时/环境/PATH/shell，最终产出 _PreparedCommand 或错误字符串。
         access = current_tool_workspace(
             self.working_dir,
             restrict_to_workspace=self.restrict_to_workspace,
@@ -409,6 +432,7 @@ class ExecTool(Tool):
                     self.sandbox,
                 )
             else:
+                # 在非 Windows 平台用沙箱后端（如 bwrap）包装命令，并将 cwd 收敛到工作区。
                 workspace = workspace_root or cwd
                 command = wrap_command(self.sandbox, command, workspace, cwd)
                 cwd = str(Path(workspace).resolve())
@@ -465,7 +489,12 @@ class ExecTool(Tool):
         *,
         stdin: int = asyncio.subprocess.DEVNULL,
     ) -> asyncio.subprocess.Process:
-        """Launch *command* in a platform-appropriate shell."""
+        """Launch *command* in a platform-appropriate shell.
+
+        平台相关的子进程启动：
+        - Windows：多行命令走 PowerShell，单行走 cmd shell。
+        - Unix：用指定 shell（默认 bash），bash/zsh 可加 -l 以加载登录配置文件。
+        """
         if _IS_WINDOWS:
             if "\n" in command:
                 return await asyncio.create_subprocess_exec(
@@ -526,7 +555,10 @@ class ExecTool(Tool):
 
     @staticmethod
     async def _kill_process(process: asyncio.subprocess.Process) -> None:
-        """Kill a subprocess and reap it to prevent zombies."""
+        """Kill a subprocess and reap it to prevent zombies.
+
+        杀掉子进程并回收，避免产生僵尸进程。Unix 下额外用 WNOHANG 清理已退出的子进程。
+        """
         process.kill()
         try:
             with suppress(asyncio.TimeoutError):
@@ -541,12 +573,10 @@ class ExecTool(Tool):
     def _build_env(self) -> dict[str, str]:
         """Build a minimal environment for subprocess execution.
 
-        On Unix, only HOME/LANG/TERM are passed; ``bash -l`` sources the
-        user's profile which sets PATH and other essentials.
-
-        On Windows, ``cmd.exe`` has no login-profile mechanism, so a curated
-        set of system variables (including PATH) is forwarded.  API keys and
-        other secrets are still excluded.
+        构建子进程的最小环境变量集，避免泄露 API 密钥等敏感信息。
+        Unix 仅传 HOME/LANG/TERM，其余由 `bash -l` 从用户 profile 加载；
+        Windows 因无登录 profile 机制，转发一组精选系统变量（含 PATH）。
+        allowed_env_keys 可额外放行配置指定的非敏感变量。
         """
         if _IS_WINDOWS:
             sr = os.environ.get("SYSTEMROOT", r"C:\Windows")
@@ -594,7 +624,14 @@ class ExecTool(Tool):
         restrict_to_workspace: bool | None = None,
         workspace_root: str | None = None,
     ) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
+        """Best-effort safety guard for potentially destructive commands.
+
+        对破坏性命令做尽力而为的安全守卫：
+        1. allow_patterns 优先于 deny_patterns，允许用户为特定命令（如构建目录内的 rm -rf）开白名单。
+        2. 检测内部/私有 URL，阻止 SSRF 访问（loopback 可由作用域放行）。
+        3. restrict_to_workspace 开启时拦截路径穿越（../）和工作区外的绝对路径。
+        返回错误字符串表示拦截，None 表示放行。
+        """
         cmd = command.strip()
         lower = cmd.lower()
 
@@ -643,6 +680,8 @@ class ExecTool(Tool):
                     # Match against the un-resolved path first.  On Linux,
                     # /dev/stderr is a symlink to /proc/self/fd/2 and
                     # ``Path.resolve()`` would mask the device-file intent.
+                    # 先按未解析路径判断；Linux 下 /dev/stderr 是 /proc/self/fd/2 的符号链接，
+                    # 直接 resolve() 会掩盖设备文件的本意。
                     if self._is_benign_device_path(expanded):
                         continue
                     p = Path(expanded).expanduser().resolve()
@@ -653,6 +692,7 @@ class ExecTool(Tool):
                     continue
 
                 media_path = get_media_dir().resolve()
+                # 允许访问：cwd 子树、media 目录（读取上传附件）、工作区根。
                 allowed = (
                     is_path_within(p, cwd_path)
                     or is_path_within(p, media_path)
@@ -676,7 +716,8 @@ class ExecTool(Tool):
 
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
-        # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`, and UNC paths like `\\server\share`
+        # 从命令中提取绝对路径用于工作区越界检查。
+        # Windows: 匹配盘符路径（C:\...）和 UNC 路径（\\server\share）
         # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
         win_paths = re.findall(
             r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",

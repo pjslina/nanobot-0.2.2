@@ -1,4 +1,10 @@
-"""Base class for agent tools."""
+"""Base class for agent tools.
+
+所有工具的抽象基类与 JSON Schema 校验框架。工具子类只需声明 name/description/
+parameters 并实现 execute，即可被 ToolLoader 自动发现并注册到 ToolRegistry，
+其 schema 会暴露给 LLM 用于函数调用。本模块同时提供 Schema 校验与参数类型强转，
+在调用前把 LLM 返回的弱类型参数规整为 schema 期望的类型。
+"""
 from __future__ import annotations
 
 import typing
@@ -31,6 +37,10 @@ class Schema(ABC):
     Concrete types live in :mod:`nanobot.agent.tools.schema`; all implement
     :meth:`to_json_schema` and :meth:`validate_value`. Class methods
     :meth:`validate_json_schema_value` and :meth:`fragment` are the shared validation and normalization entry points.
+
+    工具参数 JSON Schema 片段的抽象基类。提供静态的通用校验逻辑
+    （validate_json_schema_value）与片段归一化（fragment），具体类型
+    （StringSchema/ObjectSchema 等）定义在 schema.py 中。
     """
 
     @staticmethod
@@ -129,7 +139,12 @@ class Schema(ABC):
 
 
 class Tool(ABC):
-    """Agent capability: read files, run commands, etc."""
+    """Agent capability: read files, run commands, etc.
+
+    所有工具的抽象基类。子类声明 name/description/parameters 并实现 execute，
+    即可由 ToolLoader 自动发现并注册。基类还提供基于 schema 的参数强转
+    （cast_params）与校验（validate_params），以及并发安全性的声明属性。
+    """
 
     _TYPE_MAP = _JSON_TYPE_MAP
     _BOOL_TRUE = frozenset(("true", "1", "yes"))
@@ -176,8 +191,8 @@ class Tool(ABC):
     # --- Plugin metadata ---
 
     config_key: str = ""
-    _plugin_discoverable: bool = True
-    _scopes: set[str] = {"core"}
+    _plugin_discoverable: bool = True  # 设为 False 可让该工具不被 pkgutil 自动发现
+    _scopes: set[str] = {"core"}  # 工具所属作用域，loader 按作用域加载（如 core/webui）
 
     @classmethod
     def config_cls(cls) -> type[BaseModel] | None:
@@ -212,13 +227,19 @@ class Tool(ABC):
         return casted
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Apply safe schema-driven casts before validation."""
+        """Apply safe schema-driven casts before validation.
+
+        在校验前按 schema 做安全的类型强转（如字符串 "123" -> int 123），
+        以容忍 LLM/弱类型 provider 返回的参数类型偏差。
+        """
         schema = self.parameters or {}
         if schema.get("type", "object") != "object":
             return params
         return self._cast_object(params, schema)
 
     def _cast_value(self, val: Any, schema: dict[str, Any]) -> Any:
+        # 按单个字段的 schema 类型做安全强转：数值字符串转数值、
+        # 布尔字符串转布尔、递归处理数组/对象。已是目标类型则原样返回。
         t = self._resolve_type(schema.get("type"))
 
         if t == "boolean" and isinstance(val, bool):

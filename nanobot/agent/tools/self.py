@@ -1,4 +1,9 @@
-"""MyTool: runtime state inspection and configuration for the agent loop."""
+"""MyTool: runtime state inspection and configuration for the agent loop.
+
+MyTool：agent 运行时状态检查与配置工具。允许 LLM 检查自身配置（模型、迭代数、
+token 用量等）和设置部分可变参数，同时通过 BLOCKED/READ_ONLY/SENSITIVE 名单
+保护核心基础设施与敏感字段不被读取或修改。
+"""
 
 from __future__ import annotations
 
@@ -42,7 +47,15 @@ def _is_subagent_status(value: Any) -> bool:
 
 
 class MyTool(Tool, ContextAware):
-    """Check and set the agent loop's runtime configuration."""
+    """Check and set the agent loop's runtime configuration.
+
+    检查与设置 agent 循环的运行时配置。通过多级访问控制名单保护系统安全：
+    - BLOCKED：核心基础设施/安全边界，禁止读和写。
+    - READ_ONLY：可读不可写（如 subagents、exec_config）。
+    - _DENIED_ATTRS：危险 dunder 属性，禁止访问。
+    - _SENSITIVE_NAMES：含 api_key/secret/token 等关键词的字段，禁止访问。
+    - RESTRICTED：可写但有类型与范围校验（如 max_iterations、model）。
+    """
 
     _plugin_discoverable = False  # Requires AgentLoop reference; registered manually
     config_key = "my"
@@ -57,26 +70,41 @@ class MyTool(Tool, ContextAware):
 
     BLOCKED = frozenset({
         # Core infrastructure
+        # 核心基础设施：bus/provider/tools 等，读写均禁止。
         "bus", "provider", "_running", "tools",
         # Config management
+        # 配置管理
         "_runtime_vars",
         # Subsystems
+        # 子系统
         "runner", "sessions", "consolidator",
         "dream", "auto_compact", "context", "commands",
         # Sensitive runtime state (credentials, message routing, task tracking)
+        # 敏感运行时状态（凭据、消息路由、任务跟踪）
         "_mcp_servers", "_mcp_stacks", "_pending_queues",
         "_session_locks", "_active_tasks", "_background_tasks",
         # Security boundaries (inspect + modify both blocked)
+        # 安全边界：读写均禁止
         "restrict_to_workspace", "channels_config",
         "_concurrency_gate", "_unified_session", "_extra_hooks",
     })
 
     READ_ONLY = frozenset({
-        "subagents",  # observable but replacing it would break the system
-        "_current_iteration",  # updated by runner only
-        "exec_config",  # inspect allowed (e.g. check sandbox), modify blocked
-        "web_config",  # inspect allowed (e.g. check enable), modify blocked
-        "workspace_sandbox",  # read-only view of workspace enforcement level
+        # observable but replacing it would break the system
+        # 可观测但替换会破坏系统
+        "subagents",
+        # updated by runner only
+        # 仅由 runner 更新
+        "_current_iteration",
+        # inspect allowed (e.g. check sandbox), modify blocked
+        # 允许检查（如查看沙箱），禁止修改
+        "exec_config",
+        # inspect allowed (e.g. check enable), modify blocked
+        # 允许检查（如查看启用状态），禁止修改
+        "web_config",
+        # read-only view of workspace enforcement level
+        # 工作区强制级别只读视图
+        "workspace_sandbox",
     })
 
     _DENIED_ATTRS = frozenset({
@@ -88,6 +116,7 @@ class MyTool(Tool, ContextAware):
     })
 
     # Sub-field names that are sensitive regardless of parent path
+    # 敏感字段名：无论出现在哪级路径都禁止访问（凭据类）
     _SENSITIVE_NAMES = frozenset({
         "api_key", "secret", "password", "token", "credential",
         "private_key", "access_token", "refresh_token", "auth",
@@ -101,6 +130,7 @@ class MyTool(Tool, ContextAware):
         )
 
     RESTRICTED: dict[str, dict[str, Any]] = {
+        # 可修改但有类型与范围校验的受限键
         "max_iterations":        {"type": int, "min": 1,   "max": 100},
         "context_window_tokens": {"type": int, "min": 4096, "max": 1_000_000},
         "model":                 {"type": str, "min_len": 1},
@@ -192,6 +222,7 @@ class MyTool(Tool, ContextAware):
     # ------------------------------------------------------------------
 
     def _resolve_path(self, path: str) -> tuple[Any, str | None]:
+        # 按点分路径逐级解析属性/字典键，每级都检查是否在禁止名单中。
         parts = path.split(".")
         obj = self._runtime_state
         for part in parts:
@@ -374,6 +405,7 @@ class MyTool(Tool, ContextAware):
     # -- modify --
 
     def _modify(self, key: str | None, value: Any) -> str:
+        # 修改入口：先校验 key 合法性，再按 BLOCKED/READ_ONLY/SENSITIVE/RESTRICTED/自由键 分派。
         if err := self._validate_key(key):
             return err
         top = key.split(".")[0]
@@ -419,6 +451,8 @@ class MyTool(Tool, ContextAware):
         )
 
     def _modify_restricted(self, key: str, value: Any) -> str:
+        # 受限键修改：按 RESTRICTED 规格做类型转换与范围校验。
+        # 修改 model 时清除活跃预设；修改 max_iterations 时同步子 agent 限制。
         spec = self.RESTRICTED[key]
         expected = spec["type"]
         if expected is int and isinstance(value, bool):
@@ -444,6 +478,8 @@ class MyTool(Tool, ContextAware):
         return f"Set {key} = {value!r} (was {old!r})"
 
     def _modify_free(self, key: str, value: Any) -> str:
+        # 自由键修改：已存在的属性做类型一致性校验后 setattr；
+        # 不存在的键作为 scratchpad 条目存入 _runtime_vars（需通过 JSON 安全校验，最多 64 个键）。
         if _has_real_attr(self._runtime_state, key):
             old = getattr(self._runtime_state, key)
             if isinstance(old, (str, int, float, bool)):
@@ -481,6 +517,8 @@ class MyTool(Tool, ContextAware):
 
     @classmethod
     def _validate_json_safe(cls, value: Any, depth: int = 0) -> str | None:
+        # 递归校验值是否可安全 JSON 序列化（仅 str/int/float/bool/None/list/dict），
+        # 防止将不可序列化对象存入 scratchpad 导致持久化失败。
         if depth > 10:
             return "value nesting too deep (max 10 levels)"
         if isinstance(value, (str, int, float, bool, type(None))):

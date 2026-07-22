@@ -1,5 +1,12 @@
 """Runtime event bus for agent state notifications.
 
+运行时事件总线：用于 agent 状态变更的"进程内"通知（如 turn 开始/结束、
+运行状态变化、持续目标变化、运行时模型切换）。
+
+它与 :mod:`nanobot.bus.queue` 是两套独立机制：消息总线负责"用户/聊天"消息的
+投递，而运行时事件总线负责"进程内状态"通知，可选的订阅者（如 WebUI 适配器）
+可据此渲染实时状态，普通渠道可忽略。
+
 This bus is separate from :mod:`nanobot.bus.queue`: message bus events are
 user/chat delivery, while runtime events are in-process state notifications
 that optional subscribers such as WebUI adapters may render.
@@ -91,12 +98,18 @@ _HandlerEntry = tuple[RuntimeEventType | None, RuntimeEventHandler]
 class RuntimeEventBus:
     """Small in-process pub/sub bus for runtime state.
 
+    轻量级进程内发布/订阅总线，用于运行时状态。
+    订阅者按注册顺序执行。``publish`` 会 await 异步处理器，从而在"运行时事件
+    必须紧跟在某条用户消息之后"的场景下保持顺序；``publish_nowait`` 供同步
+    调用点使用（内部用 create_task 调度，不阻塞）。
+
     Subscribers run in registration order. ``publish`` awaits async handlers so
     callers can preserve ordering when a runtime event must follow a user
     message. ``publish_nowait`` is available for synchronous call sites.
     """
 
     def __init__(self) -> None:
+        # 处理器列表：每项为 (事件类型|None, 处理函数)。事件类型为 None 表示订阅所有事件。
         self._handlers: list[_HandlerEntry] = []
 
     def subscribe(
@@ -104,6 +117,7 @@ class RuntimeEventBus:
         handler: RuntimeEventHandler,
         event_type: RuntimeEventType | None = None,
     ) -> Callable[[], None]:
+        # 订阅事件；返回取消订阅函数。event_type 为 None 时订阅全部类型。
         entry = (event_type, handler)
         self._handlers.append(entry)
 
@@ -114,6 +128,8 @@ class RuntimeEventBus:
         return _unsubscribe
 
     async def publish(self, event: RuntimeEvent) -> None:
+        # 按注册顺序通知所有匹配的订阅者；await 异步处理器以保持顺序。
+        # 单个处理器抛异常不影响其他处理器（捕获并记日志）。
         for event_type, handler in list(self._handlers):
             if event_type is not None and not isinstance(event, event_type):
                 continue
@@ -125,6 +141,8 @@ class RuntimeEventBus:
                 logger.exception("runtime event handler failed for {}", type(event).__name__)
 
     def publish_nowait(self, event: RuntimeEvent) -> None:
+        # 同步调用点使用：把 publish 作为任务调度到事件循环，不阻塞当前调用。
+        # 没有运行中的事件循环时丢弃事件（仅记 debug 日志）。
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

@@ -1,4 +1,10 @@
-"""Shared lifecycle hook primitives for agent runs."""
+"""Shared lifecycle hook primitives for agent runs.
+
+agent 运行生命周期的"钩子"原语。提供扩展点让外部代码（如 WebUI 进度推送、
+SDK 结果捕获）介入 agent 的一次 run/每一轮 iteration，而无需修改 runner 主体。
+采用组合模式（CompositeHook）：把多个钩子串成一个，按顺序调用，且单个钩子抛异常
+不会影响其他钩子或 agent 主循环。
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,10 @@ from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 @dataclass(slots=True)
 class AgentHookContext:
-    """Mutable per-iteration state exposed to runner hooks."""
+    """Mutable per-iteration state exposed to runner hooks.
+
+    每一轮 iteration 暴露给钩子的可变状态（消息、响应、用量、工具调用/结果等）。
+    """
 
     iteration: int
     messages: list[dict[str, Any]]
@@ -31,7 +40,10 @@ class AgentHookContext:
 
 @dataclass(slots=True)
 class AgentRunHookContext:
-    """Run-level state snapshot exposed to runner hooks."""
+    """Run-level state snapshot exposed to runner hooks.
+
+    一次 run（整轮 turn）级别的状态快照，暴露给钩子。
+    """
 
     messages: list[dict[str, Any]]
     final_content: str | None = None
@@ -45,12 +57,18 @@ class AgentRunHookContext:
 
 
 class AgentHook:
-    """Minimal lifecycle surface for shared runner customization."""
+    """Minimal lifecycle surface for shared runner customization.
+
+    钩子基类：定义 runner 定制用的最小生命周期接口。
+    子类按需覆写各回调（before_run/after_run/before_iteration/on_stream/...），
+    默认实现都是空操作。reraise=True 时该钩子的异常会向上抛出而非被吞掉。
+    """
 
     def __init__(self, reraise: bool = False) -> None:
         self._reraise = reraise
 
     def wants_streaming(self) -> bool:
+        # 是否需要流式增量回调；默认不需要。
         return False
 
     async def before_run(self, context: AgentRunHookContext) -> None:
@@ -98,6 +116,10 @@ class AgentHook:
 class CompositeHook(AgentHook):
     """Fan-out hook that delegates to an ordered list of hooks.
 
+    组合钩子：把多个钩子串成一个，按注册顺序依次调用（扇出）。
+    错误隔离：异步方法逐个捕获并记录每个钩子的异常，单个有问题的自定义钩子
+    不会拖垮整个 agent 循环；finalize_content 是管道式串联（不隔离，bug 应暴露）。
+
     Error isolation: async methods catch and log per-hook exceptions
     so a faulty custom hook cannot crash the agent loop.
     ``finalize_content`` is a pipeline (no isolation — bugs should surface).
@@ -113,6 +135,7 @@ class CompositeHook(AgentHook):
         return any(h.wants_streaming() for h in self._hooks)
 
     async def _for_each_hook_safe(self, method_name: str, *args: Any, **kwargs: Any) -> None:
+        # 逐个调用子钩子的同名方法；非 reraise 钩子的异常被捕获并记日志（隔离）。
         for h in self._hooks:
             if getattr(h, "_reraise", False):
                 await getattr(h, method_name)(*args, **kwargs)

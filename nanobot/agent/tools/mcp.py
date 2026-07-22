@@ -1,4 +1,8 @@
-"""MCP client: connects to MCP servers and wraps their tools as native nanobot tools."""
+"""MCP client: connects to MCP servers and wraps their tools as native nanobot tools.
+
+MCP 客户端：连接外部 MCP 服务器，将其工具/资源/提示词包装为 nanobot 原生工具。
+支持 stdio / SSE / streamable HTTP 三种传输，处理会话终止重连、热重载与瞬时错误重试。
+"""
 
 import asyncio
 import os
@@ -26,6 +30,7 @@ from nanobot.security.network import validate_url_target
 # Transient connection errors that warrant a single retry.
 # These typically happen when an MCP server restarts or a network
 # connection is interrupted between calls.
+# 瞬时连接错误集合：命中则重试一次，通常发生在 MCP 服务器重启或网络中断时。
 _TRANSIENT_EXC_NAMES: frozenset[str] = frozenset((
     "ClosedResourceError",
     "BrokenResourceError",
@@ -41,12 +46,14 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 
 # Characters allowed in tool names by model providers (Anthropic, OpenAI, etc.).
 # Replace anything outside [a-zA-Z0-9_-] with underscore and collapse runs.
+# 模型供应商允许的工具名字符集；非法字符替换为下划线并合并连续下划线，保证模型 API 兼容。
 _SANITIZE_RE = re.compile(r"_+")
 _RELOAD_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
 
 
 def _is_malformed_mcp_progress_notification(message: Any) -> bool:
+    # 判断是否为缺少 progressToken 的畸形进度通知，这类消息会丢弃以免污染协议流。
     payload = _mcp_jsonrpc_payload(message)
     if _payload_value(payload, "method") != "notifications/progress":
         return False
@@ -146,6 +153,9 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
     closed — those transports use anyio task groups whose cleanup can raise
     ``RuntimeError`` / ``ExceptionGroup`` that escape the caller's try/except
     and crash the event loop.
+
+    快速 TCP 探测：端口关闭时避免进入 streamable_http_client / sse_client，
+    这些传输的 anyio 任务组在清理时抛出的异常会逃出 try/except 并崩溃事件循环。
     """
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or "127.0.0.1"
@@ -166,7 +176,10 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
 
 
 async def _validate_mcp_request_url(request: httpx.Request) -> None:
-    """Validate each outgoing MCP HTTP request, including redirect targets."""
+    """Validate each outgoing MCP HTTP request, including redirect targets.
+
+    校验每个发出的 MCP HTTP 请求（含重定向目标），阻止不安全的 URL（SSRF 防护）。
+    """
     ok, error = validate_url_target(str(request.url))
     if not ok:
         raise httpx.RequestError(
@@ -185,7 +198,11 @@ def _normalize_windows_stdio_command(
     args: list[str] | None,
     env: dict[str, str] | None,
 ) -> tuple[str, list[str], dict[str, str] | None]:
-    """Wrap Windows shell launchers so MCP stdio servers start reliably."""
+    """Wrap Windows shell launchers so MCP stdio servers start reliably.
+
+    在 Windows 上包装 shell 启动器（npx/npm/pnpm/yarn/bunx 及 .cmd/.bat 脚本），
+    使其通过 cmd /d /c 启动，保证 MCP stdio 服务器能可靠启动。
+    """
     normalized_args = list(args or [])
     if os.name != "nt":
         return command, normalized_args, env
@@ -232,7 +249,11 @@ def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None
 
 
 def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
-    """Normalize only nullable JSON Schema patterns for tool definitions."""
+    """Normalize only nullable JSON Schema patterns for tool definitions.
+
+    将 MCP 工具的 JSON Schema 中 nullable 模式（type 数组含 null、oneOf/anyOf 含
+    null 分支）规范化为 OpenAI 兼容形式，确保工具定义能被各模型供应商正确解析。
+    """
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
 
@@ -273,7 +294,10 @@ def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
 
 
 class _MCPWrapperBase(Tool):
-    """Common reconnect handling for wrappers bound to one MCP server session."""
+    """Common reconnect handling for wrappers bound to one MCP server session.
+
+    所有 MCP 包装器的基类：管理与单个 MCP 服务器会话的绑定及会话终止后的重连逻辑。
+    """
 
     _plugin_discoverable = False
 
@@ -291,6 +315,8 @@ class _MCPWrapperBase(Tool):
         already_refreshed: bool,
         capability_kind: str,
     ) -> bool:
+        # 会话被服务端终止时，通过 reconnect 回调重建连接并刷新本地会话引用。
+        # already_refreshed 防止无限重连循环；返回 True 表示已刷新可重试本次调用。
         if already_refreshed or not _is_session_terminated(exc) or self._reconnect is None:
             return False
         logger.warning(
@@ -314,7 +340,11 @@ class _MCPWrapperBase(Tool):
 
 
 class MCPToolWrapper(_MCPWrapperBase):
-    """Wraps a single MCP server tool as a nanobot Tool."""
+    """Wraps a single MCP server tool as a nanobot Tool.
+
+    将单个 MCP 服务器工具包装为 nanobot 原生工具。execute 负责调用远端工具并处理
+    超时、取消、会话终止重连、瞬时错误重试等异常情况。
+    """
 
     _plugin_discoverable = False
 
@@ -342,6 +372,8 @@ class MCPToolWrapper(_MCPWrapperBase):
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
 
+        # 重试状态标志：retried_transient 限制瞬时错误只重试一次，
+        # refreshed_session 限制会话终止只重连一次，避免无限重试。
         retried_transient = False
         refreshed_session = False
         while True:
@@ -358,6 +390,8 @@ class MCPToolWrapper(_MCPWrapperBase):
             except asyncio.CancelledError:
                 # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
                 # Re-raise only if our task was externally cancelled (e.g. /stop).
+                # MCP SDK 的 anyio 取消作用域在超时/失败时会泄漏 CancelledError。
+                # 仅当任务被外部取消（如用户 /stop）时才向上传播，否则视为服务端取消并返回提示。
                 task = asyncio.current_task()
                 if task is not None and task.cancelling() > 0:
                     raise
@@ -650,9 +684,9 @@ async def connect_mcp_servers(
 ) -> dict[str, AsyncExitStack]:
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
-    Returns a dict mapping server name -> its dedicated AsyncExitStack.
-    Each server gets its own stack to prevent cancel scope conflicts
-    when multiple MCP servers are configured.
+    连接已配置的 MCP 服务器并注册其工具/资源/提示词。
+    返回 服务器名 -> 专属 AsyncExitStack 的映射。每个服务器使用独立栈，
+    避免多个 MCP 服务器配置时出现 cancel scope 冲突。
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
@@ -755,6 +789,7 @@ async def connect_mcp_servers(
             session = await server_stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
+            # 枚举工具并按 enabledTools 白名单过滤（"*" 表示全部允许）。
             tools = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
             allow_all_tools = "*" in enabled_tools
@@ -831,6 +866,7 @@ async def connect_mcp_servers(
         except Exception as e:
             hint = ""
             text = str(e).lower()
+            # 检测 stdio 协议污染：MCP 服务器应只向 stdout 写 JSON-RPC，日志/调试输出应走 stderr。
             if any(
                 marker in text
                 for marker in (
@@ -955,7 +991,12 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
 
 
 async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
-    """Reconcile live MCP connections with the current config file."""
+    """Reconcile live MCP connections with the current config file.
+
+    热重载：将当前活跃的 MCP 连接与配置文件对账。对比计算出 added/changed/removed，
+    关闭并注销已移除或变更的服务器，连接新增或变更的服务器，并重试此前连接失败的服务器。
+    全程在 per-state 锁保护下进行，避免并发重载。
+    """
     async with _reload_lock(state):
         try:
             from nanobot.config.loader import load_config, resolve_config_env_vars
@@ -1040,7 +1081,11 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
 
 
 async def request_mcp_reload(bus: Any, *, timeout: float = 15.0) -> dict[str, Any]:
-    """Ask the running agent loop to reconcile live MCP connections."""
+    """Ask the running agent loop to reconcile live MCP connections.
+
+    通过 MessageBus 向运行中的 AgentLoop 发送运行时控制消息，请求其热重载 MCP 配置。
+    使用 Future 等待 AgentLoop 的确认结果，超时则提示需重启。
+    """
     loop = asyncio.get_running_loop()
     ack: asyncio.Future[dict[str, Any]] = loop.create_future()
     await bus.publish_inbound(
@@ -1132,6 +1177,8 @@ async def _refresh_terminated_server(
     tool_name: str,
     stale_tool: Tool,
 ) -> Tool | None:
+    # 会话终止后的重连流程：注销旧工具、关闭旧连接、重新连接服务器并注册新工具。
+    # 在 per-state 锁内执行，若期间已被其他流程重连则直接返回当前工具。
     async with _reload_lock(state):
         cfg = state._mcp_servers.get(server_name)
         if cfg is None:

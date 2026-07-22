@@ -1,4 +1,10 @@
-"""Shared execution loop for tool-using agents."""
+"""Shared execution loop for tool-using agents.
+
+本模块是 nanobot agent 与 LLM 交互的核心执行引擎。AgentRunner 负责多轮对话主循环：
+向 provider 发送消息 -> 接收响应/工具调用 -> 执行工具 -> 回填工具结果 -> 继续下一轮，
+直到模型不再请求工具调用并产出最终响应。同时负责上下文治理（裁剪/紧凑/预算控制）、
+流式响应回调、重试与超时、token 用量统计、注入（injections）控制以及安全边界（SSRF/工作区）处理。
+"""
 
 from __future__ import annotations
 
@@ -62,18 +68,19 @@ _ARREARAGE_ERROR_MESSAGE = (
     "account is in arrears. Please top up / check the billing status of your API key and try again."
 )
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
-_MAX_EMPTY_RETRIES = 2
-_MAX_LENGTH_RECOVERIES = 3
-_MAX_INJECTIONS_PER_TURN = 3
-_MAX_INJECTION_CYCLES = 5
-_SNIP_SAFETY_BUFFER = 1024
-_MICROCOMPACT_KEEP_RECENT = 10
-_MICROCOMPACT_MIN_CHARS = 500
-_COMPACTABLE_TOOLS = frozenset({
+_MAX_EMPTY_RETRIES = 2  # 模型返回空内容时的最大重试次数
+_MAX_LENGTH_RECOVERIES = 3  # finish_reason=length（输出被截断）时的恢复尝试次数
+_MAX_INJECTIONS_PER_TURN = 3  # 单轮最多注入的用户消息条数（防止注入风暴）
+_MAX_INJECTION_CYCLES = 5  # 单次 run 最多触发的注入循环次数（防止无限续跑）
+_SNIP_SAFETY_BUFFER = 1024  # 上下文裁剪时为输出预留的安全余量（token）
+_MICROCOMPACT_KEEP_RECENT = 10  # 微紧凑时保留最近多少条可压缩工具结果
+_MICROCOMPACT_MIN_CHARS = 500  # 工具结果短于此长度不参与微紧凑
+_COMPACTABLE_TOOLS = frozenset({  # 可被微紧凑替换为摘要的工具集合
     "read_file", "exec", "grep", "find_files",
     "web_search", "web_fetch", "list_dir", "list_exec_sessions",
 })
 # read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
+# read_file 是持久化结果的恢复路径；豁免它以避免 persist->read->persist 死循环。
 _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 
@@ -84,7 +91,15 @@ prepare_file_edit_tracker = _prepare_file_edit_tracker
 
 @dataclass(slots=True)
 class AgentRunSpec:
-    """Configuration for a single agent execution."""
+    """Configuration for a single agent execution.
+
+    描述一次 agent 执行所需的全部输入配置：初始消息列表、工具注册表、模型名、
+    最大迭代轮数、工具结果字符上限、温度/max_tokens/reasoning_effort 等 LLM 参数，
+    以及钩子（hook）、并发工具开关、工作区路径、会话键、上下文窗口/token 预算、
+    provider 重试模式、流式与进度回调、检查点回调、注入回调、LLM 超时、
+    持续目标（sustained goal）谓词与续跑消息、达到最大迭代时是否尝试收尾等。
+    该 dataclass 是 AgentRunner.run 的唯一入参（除 provider 外）。
+    """
 
     initial_messages: list[dict[str, Any]]
     tools: ToolRegistry
@@ -117,7 +132,12 @@ class AgentRunSpec:
 
 @dataclass(slots=True)
 class AgentRunResult:
-    """Outcome of a shared agent execution."""
+    """Outcome of a shared agent execution.
+
+    一次 agent 执行的最终结果：最终回复内容、完整消息历史、已用工具名列表、
+    累计 token 用量、停止原因（completed/tool_error/error/max_iterations/empty_final_response/
+    cancelled 等）、错误信息、工具事件流、以及是否发生过注入。
+    """
 
     final_content: str | None
     messages: list[dict[str, Any]]
@@ -130,13 +150,25 @@ class AgentRunResult:
 
 
 class AgentRunner:
-    """Run a tool-capable LLM loop without product-layer concerns."""
+    """Run a tool-capable LLM loop without product-layer concerns.
+
+    AgentRunner 是 agent 与 LLM 交互的核心。它只依赖一个 LLMProvider 实例，
+    通过 run(spec) 启动一次完整的多轮对话循环。每轮迭代：
+    1) 对历史消息做上下文治理（裁剪/紧凑/预算/孤儿修复），生成发给模型的 messages_for_model；
+    2) 调用 provider 获取响应（支持流式/非流式/进度流式）；
+    3) 若模型请求工具调用 -> 执行工具 -> 把工具结果回填到 messages -> 继续下一轮；
+    4) 若模型不再请求工具 -> 走最终响应收尾路径（处理空内容重试、length 截断恢复、注入、收尾）。
+    循环终止条件：模型给出最终回复、达到 max_iterations、发生致命工具错误、或 LLM 错误且无注入续跑。
+    本类不处理渠道/会话持久化等产品层逻辑，仅聚焦对话循环本身。
+    """
 
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
+        # 合并两条消息的 content：纯文本则用空行拼接；否则统一转成 content blocks 列表后拼接。
+        # 用于把注入的用户消息合并到相邻的同角色消息上，保持消息角色交替合法。
         if isinstance(left, str) and isinstance(right, str):
             return f"{left}\n\n{right}" if left else right
 
@@ -158,7 +190,11 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         injections: list[dict[str, Any]],
     ) -> None:
-        """Append injected user messages while preserving role alternation."""
+        """Append injected user messages while preserving role alternation.
+
+        将注入的用户消息追加到 messages，同时保持消息角色交替（user/assistant）合法：
+        若最后一条已是 user，则把注入内容合并进去，而不是新增连续两条 user 消息。
+        """
         for injection in injections:
             if (
                 messages
@@ -187,6 +223,15 @@ class AgentRunner:
     ) -> tuple[bool, int]:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
+        尝试排空待注入的用户消息。返回 (是否应继续下一轮迭代, 更新后的注入循环计数)。
+
+        流程：
+        1) 若尚未超过 _MAX_INJECTION_CYCLES，调用 _drain_injections 拉取注入消息；
+        2) 若没有注入但允许 goal 续跑且 sustained-goal 仍激活，构造一条续跑消息作为注入；
+        3) 若仍无注入，返回 (False, cycles) —— 当前路径收尾，不继续迭代；
+        4) 若有真实注入，cycles+1；若提供了 assistant_message，先把它追加进 messages
+           （并可选发 final_response 检查点），再追加注入消息，返回 (True, cycles) 让主循环继续。
+
         If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
         append them to *messages* (and emit a checkpoint if *assistant_message*
         and *iteration* are both provided) and return (True, cycles+1) so the
@@ -194,10 +239,11 @@ class AgentRunner:
         """
         injections: list[dict[str, Any]] = []
         real_injection = False
-        if injection_cycles < _MAX_INJECTION_CYCLES:
+        if injection_cycles < _MAX_INJECTION_CYCLES:  # 超过上限则不再拉取新注入
             injections = await self._drain_injections(spec)
             real_injection = bool(injections)
         if not injections and allow_goal_continue and assistant_message is not None:
+            # 没有外部注入，但 sustained-goal 仍处于激活态 -> 注入续跑提示，让 agent 继续
             predicate = spec.goal_active_predicate
             if predicate is not None and predicate():
                 injections = [self._build_goal_continue_message(spec)]
@@ -206,6 +252,7 @@ class AgentRunner:
         if real_injection:
             injection_cycles += 1
         if assistant_message is not None:
+            # 先落盘本轮 assistant 回复，再追加注入的用户消息，保持角色交替合法
             messages.append(assistant_message)
             if iteration is not None:
                 await self._emit_checkpoint(
@@ -242,6 +289,12 @@ class AgentRunner:
     async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
         """Drain pending user messages via the injection callback.
 
+        通过 spec.injection_callback 拉取待注入的用户消息并归一化。
+        - 回调签名若接受 limit 参数（或 **kwargs），则传入 _MAX_INJECTIONS_PER_TURN 限制条数；
+        - 返回项支持 dict 或带 content 属性的对象，统一转成 {"role":"user","content":...}；
+        - 超过 _MAX_INJECTIONS_PER_TURN 的部分会被截断并告警（不静默丢弃）；
+        - 回调抛异常时返回空列表，不影响主循环。
+
         Returns normalized user messages (capped by
         ``_MAX_INJECTIONS_PER_TURN``), or an empty list when there is
         nothing to inject. Messages beyond the cap are logged so they
@@ -250,12 +303,13 @@ class AgentRunner:
         if spec.injection_callback is None:
             return []
         try:
+            # 探测回调是否接受 limit 参数，以决定是否在调用时传入上限
             signature = inspect.signature(spec.injection_callback)
             accepts_limit = (
                 "limit" in signature.parameters
                 or any(
-                    parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in signature.parameters.values()
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in signature.parameters.values()
                 )
             )
             if accepts_limit:
@@ -277,6 +331,7 @@ class AgentRunner:
                 continue
             if isinstance(item, dict):
                 continue
+            # 非字典对象：取其 content 属性，否则转字符串
             content = getattr(item, "content") if hasattr(item, "content") else str(item)
             if self._has_injection_content(content):
                 injected_messages.append({"role": "user", "content": content})
@@ -291,6 +346,7 @@ class AgentRunner:
 
     @staticmethod
     def _has_injection_content(content: Any) -> bool:
+        # 判断注入内容是否非空：字符串需非空白，列表需非空，其余类型视为有内容。
         if content is None:
             return False
         if isinstance(content, str):
@@ -300,6 +356,9 @@ class AgentRunner:
         return True
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        # agent 执行的公开入口。包装 _run_core，统一处理 AgentHook 生命周期：
+        # before_run -> _run_core -> after_run / on_error -> on_finally。
+        # CancelledError 透传（不做错误归因）；其它异常记录 stop_reason=error 并触发 on_error。
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
@@ -308,12 +367,14 @@ class AgentRunner:
             await hook.before_run(context)
             result = await self._run_core(spec, hook, messages)
         except asyncio.CancelledError as exc:
+            # 取消不视为错误：记录 stop_reason=cancelled 后重新抛出
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
             context.error = None
             context.exception = exc
             raise
         except Exception as exc:
+            # 任意异常：归因错误并触发 on_error 钩子后重新抛出
             context.messages = deepcopy(messages)
             context.stop_reason = "error"
             context.error = f"Error: {type(exc).__name__}: {exc}"
@@ -321,6 +382,7 @@ class AgentRunner:
             await hook.on_error(context)
             raise
         else:
+            # 正常完成：把结果回填到 context 并触发 after_run
             context.messages = deepcopy(result.messages)
             context.final_content = result.final_content
             context.tools_used = list(result.tools_used)
@@ -335,6 +397,7 @@ class AgentRunner:
             await hook.after_run(context)
             return result
         finally:
+            # 无论成功/失败/取消，始终触发 on_finally（异常后吞掉其二次异常以免遮蔽）
             context.messages = deepcopy(messages)
             if context.exception is None:
                 await hook.on_finally(context)

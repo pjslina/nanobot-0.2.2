@@ -1,4 +1,10 @@
-"""Configuration schema using Pydantic."""
+"""Configuration schema using Pydantic.
+
+nanobot 的核心配置 Schema，基于 Pydantic 定义所有可配置项。
+配置从 ~/.nanobot/config.json 加载，JSON 键使用 camelCase，Python 字段使用
+snake_case，两者通过 Base 基类的 alias_generator 自动互通。本模块同时定义了
+模型 preset（预设）解析与 provider 自动匹配逻辑。
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,57 +28,75 @@ if TYPE_CHECKING:
 class ChannelsConfig(Base):
     """Configuration for chat channels.
 
+    聊天渠道的统一配置。内置与插件渠道各自的配置以"额外字段"(dict)形式存放，
+    每个渠道在自身 __init__ 中解析自己的配置项。某渠道设置 streaming=true
+    可启用流式输出（需该渠道实现 send_delta）。
+
     Built-in and plugin channel configs are stored as extra fields (dicts).
     Each channel parses its own config in __init__.
     Per-channel "streaming": true enables streaming output (requires send_delta impl).
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow")  # 允许额外字段：各渠道的专属配置项
 
-    send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
-    show_reasoning: bool = True  # surface model reasoning when channel implements it
-    extract_document_text: bool = True  # extract text from document attachments before sending to the model
-    send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
-    transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
-    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Deprecated: use top-level transcription.language
+    send_progress: bool = True  # 将 agent 的文本生成进度流式推送到渠道
+    send_tool_hints: bool = False  # 流式推送工具调用提示（如 read_file("…")）
+    show_reasoning: bool = True  # 在渠道支持时展示模型的推理过程
+    extract_document_text: bool = True  # 发送给模型前先从文档附件中抽取文本
+    send_max_retries: int = Field(default=3, ge=0, le=10)  # 投递最大尝试次数（含首次发送）
+    transcription_provider: str = "groq"  # 已废弃：改用顶层 transcription.provider
+    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # 已废弃：改用顶层 transcription.language
 
 
 class TranscriptionConfig(Base):
-    """Cross-channel audio transcription configuration."""
+    """Cross-channel audio transcription configuration.
+
+    跨渠道的语音转写配置，所有渠道共用。provider 由
+    nanobot.audio.transcription_registry 做合法性校验。
+    """
 
     enabled: bool = True
-    provider: str | None = None  # Validated by nanobot.audio.transcription_registry.
+    provider: str | None = None  # 转写服务商，由 nanobot.audio.transcription_registry 校验
     model: str | None = None
-    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
-    max_duration_sec: int = Field(default=120, ge=1, le=600)
-    max_upload_mb: int = Field(default=25, ge=1, le=100)
+    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # 语言代码，如 "zh"、"en"
+    max_duration_sec: int = Field(default=120, ge=1, le=600)  # 单条音频最大时长（秒）
+    max_upload_mb: int = Field(default=25, ge=1, le=100)  # 音频上传体积上限（MB）
 
 
 class DreamConfig(Base):
-    """Dream memory consolidation configuration."""
+    """Dream memory consolidation configuration.
+
+    Dream 记忆整合配置。Dream 是 nanobot 的两阶段记忆整合机制，会定期把会话
+    历史归纳写入长期记忆。
+    """
 
     _HOUR_MS = 3_600_000
 
-    enabled: bool = True  # Register the periodic Dream consolidation job on startup
-    interval_h: int = Field(default=2, ge=1)  # Every 2 hours by default
-    cron: str | None = Field(default=None, exclude=True)  # Legacy cron expression override
+    enabled: bool = True  # 启动时是否注册周期性 Dream 整合任务
+    interval_h: int = Field(default=2, ge=1)  # 默认每 2 小时执行一次
+    cron: str | None = Field(default=None, exclude=True)  # 旧的 cron 表达式覆盖（不序列化输出）
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
-    )  # Override model for Dream sessions (pending implementation)
-    max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
-    max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
-    annotate_line_ages: bool = True  # Deprecated: no longer used
+    )  # 为 Dream 会话指定单独的模型（待实现）
+    max_batch_size: int = Field(default=20, ge=1)  # 已废弃：不再使用
+    max_iterations: int = Field(default=15, ge=1)  # 已废弃：不再使用
+    annotate_line_ages: bool = True  # 已废弃：不再使用
 
     def build_schedule(self, timezone: str) -> CronSchedule:
-        """Build the runtime schedule, preferring the legacy cron override if present."""
+        """Build the runtime schedule, preferring the legacy cron override if present.
+
+        构造运行时调度计划：若设置了旧版 cron 表达式则优先用它，否则按间隔小时数生成。
+        """
         if self.cron:
             return CronSchedule(kind="cron", expr=self.cron, tz=timezone)
         return CronSchedule(kind="every", every_ms=self.interval_h * self._HOUR_MS)
 
     def describe_schedule(self) -> str:
-        """Return a human-readable summary for logs and startup output."""
+        """Return a human-readable summary for logs and startup output.
+
+        返回人类可读的调度摘要，用于日志与启动输出。
+        """
         if self.cron:
             return f"cron {self.cron} (legacy)"
         hours = self.interval_h
@@ -80,7 +104,10 @@ class DreamConfig(Base):
 
 
 class InlineFallbackConfig(Base):
-    """One inline fallback model configuration."""
+    """One inline fallback model configuration.
+
+    内联的备选模型配置，可直接在 fallback_models 中声明完整的模型参数。
+    """
 
     model: str
     provider: str
@@ -90,21 +117,25 @@ class InlineFallbackConfig(Base):
     reasoning_effort: str | None = None
 
 
-FallbackCandidate = str | InlineFallbackConfig
+FallbackCandidate = str | InlineFallbackConfig  # 备选项既可以是 preset 名称，也可以是内联配置
 
 
 class ModelPresetConfig(Base):
-    """A named set of model + generation parameters for quick switching."""
+    """A named set of model + generation parameters for quick switching.
+
+    命名的模型预设：把"模型 + 生成参数"打包，便于用 /model 命令快速切换。
+    """
 
     label: str | None = None
     model: str
-    provider: str = "auto"
+    provider: str = "auto"  # "auto" 表示按模型名自动推断 provider
     max_tokens: int = 8192
     context_window_tokens: int = 200_000
     temperature: float = 0.1
     reasoning_effort: str | None = None
 
     def to_generation_settings(self) -> Any:
+        """转换为 provider 层使用的 GenerationSettings 对象。"""
         from nanobot.providers.base import GenerationSettings
         return GenerationSettings(
             temperature=self.temperature,
@@ -114,7 +145,10 @@ class ModelPresetConfig(Base):
 
 
 class AgentDefaults(Base):
-    """Default agent configuration."""
+    """Default agent configuration.
+
+    Agent 默认配置。model_preset 若设置，会优先于下面单独的 model/provider 等字段生效。
+    """
 
     workspace: str = "~/.nanobot/workspace"
     model_preset: str | None = None  # Active preset name — takes precedence over fields below

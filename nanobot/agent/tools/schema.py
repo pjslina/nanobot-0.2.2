@@ -1,12 +1,16 @@
 """JSON Schema fragment types: all subclass :class:`~nanobot.agent.tools.base.Schema` for descriptions and constraints on tool parameters.
 
-- ``to_json_schema()``: returns a dict compatible with :meth:`~nanobot.agent.tools.base.Schema.validate_json_schema_value` /
-  :class:`~nanobot.agent.tools.base.Tool`.
-- ``validate_value(value, path)``: validates a single value against this schema; returns a list of error messages (empty means valid).
+JSON Schema 片段类型：用于声明工具参数的类型与约束。每个工具用这些 schema
+（StringSchema/ObjectSchema 等）描述自己的参数，框架再转成 JSON Schema 暴露给 LLM，
+让模型知道如何正确调用工具。所有片段都继承自 :class:`~nanobot.agent.tools.base.Schema`。
 
-Shared validation and fragment normalization are on the class methods of :class:`~nanobot.agent.tools.base.Schema`.
+- ``to_json_schema()``：返回与 :meth:`~nanobot.agent.tools.base.Schema.validate_json_schema_value` /
+  :class:`~nanobot.agent.tools.base.Tool` 兼容的 dict。
+- ``validate_value(value, path)``：校验单个值是否符合本 schema，返回错误消息列表（空表示合法）。
 
-Note: Python does not allow subclassing ``bool``, so booleans use :class:`BooleanSchema`.
+共享的校验与片段归一化逻辑在 :class:`~nanobot.agent.tools.base.Schema` 的类方法上。
+
+注意：Python 不允许子类化 ``bool``，所以布尔值用独立的 :class:`BooleanSchema`。
 """
 
 from __future__ import annotations
@@ -226,6 +230,10 @@ def tool_parameters_schema(
     **properties: Any,
 ) -> dict[str, Any]:
     """Build root tool parameters ``{"type": "object", "properties": ...}`` for :meth:`Tool.parameters`.
+
+    构建工具的根参数 schema（``{"type": "object", "properties": ...}``）。
+    内置工具默认使用严格参数对象（additionalProperties=False），这样拼错的工具调用参数
+    会在执行前被报错，而非被静默忽略。传 ``additional_properties=None`` 可省略该 JSON Schema 关键字。
 
     Built-in tools default to strict parameter objects so misspelled tool-call
     arguments are reported before execution instead of being silently ignored.

@@ -1,4 +1,11 @@
-"""Image generation provider helpers."""
+"""Image generation provider helpers.
+
+图像生成 Provider 适配模块：将多个后端（OpenAI、Gemini/Imagen、Ollama、
+AIHubMix、MiniMax、StepFun、Zhipu、OpenRouter、Codex OAuth 等）统一抽象为
+同一个 ``generate`` 接口，供 agent 的图像生成工具调用。各 provider 负责把
+统一的 prompt / 参考图 / 宽高比 / 尺寸参数翻译成各自 API 的请求格式，并把
+返回的图像统一归一化为 ``data:image/...;base64,...`` 数据 URL。
+"""
 
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ _OPENROUTER_ATTRIBUTION_HEADERS = {
 }
 _DEFAULT_TIMEOUT_S = 120.0
 _AIHUBMIX_TIMEOUT_S = 300.0
+# AIHubMix 按宽高比映射到 OpenAI Images API 风格的尺寸字符串
 _AIHUBMIX_ASPECT_RATIO_SIZES = {
     "1:1": "1024x1024",
     "3:4": "1024x1536",
@@ -34,6 +42,7 @@ _AIHUBMIX_ASPECT_RATIO_SIZES = {
 _GEMINI_DEFAULT_TIMEOUT_S = 120.0
 _GEMINI_IMAGEN_ASPECT_RATIOS = {"1:1", "9:16", "16:9", "3:4", "4:3"}
 _OLLAMA_DEFAULT_SIDE = 1024
+# Ollama 尺寸预设：以长边像素数表示
 _OLLAMA_SIZE_PRESETS = {
     "1K": 1024,
     "2K": 2048,
@@ -132,7 +141,7 @@ async def _download_image_data_url(
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# Registry 注册表：按 provider 名注册图像生成客户端类，供运行时按名查找
 # ---------------------------------------------------------------------------
 
 _IMAGE_GEN_PROVIDERS: dict[str, type[ImageGenerationProvider]] = {}
@@ -141,8 +150,7 @@ _IMAGE_GEN_PROVIDERS: dict[str, type[ImageGenerationProvider]] = {}
 def register_image_gen_provider(cls: type[ImageGenerationProvider]) -> None:
     """Register an image provider at import time only.
 
-    The registry is populated by module side effects so provider discovery
-    stays lazy and consistent across the process.
+    在导入期通过模块副作用注册图像 provider 类，使发现过程保持惰性且全进程一致。
     """
     name = cls.provider_name
     if not name:
@@ -169,12 +177,16 @@ def image_gen_provider_configs(config: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Base class
+# Base class 基类：所有图像生成 provider 的统一抽象基类
 # ---------------------------------------------------------------------------
 
 
 class ImageGenerationProvider(ABC):
-    """Base class for image generation provider clients."""
+    """Base class for image generation provider clients.
+
+    图像生成 provider 抽象基类，定义统一的 ``generate`` 接口与公共 HTTP 辅助方法。
+    子类需实现 ``generate``，并可通过 ``provider_name`` 参与注册表查找。
+    """
 
     provider_name: str = ""
     missing_key_message: str = ""

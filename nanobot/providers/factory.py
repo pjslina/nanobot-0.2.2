@@ -1,4 +1,9 @@
-"""Create LLM providers from config."""
+"""Create LLM providers from config.
+
+根据配置创建 LLM 提供方实例的工厂模块。职责是：解析模型预设（preset），
+按 provider 名找到对应 ProviderSpec，依据 backend 类型实例化具体的 provider
+实现，并在配置了 fallback_models 时用 FallbackProvider 包装以支持主备切换。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,12 @@ from nanobot.providers.registry import create_dynamic_spec, find_by_name
 
 @dataclass(frozen=True)
 class ProviderSnapshot:
+    """已构建的 provider 快照，包含实例、模型名、有效上下文窗口和配置签名。
+
+    签名用于检测配置是否变化（见 provider_signature），变化时需重建 provider。
+    context_window_tokens 取主模型与所有 fallback 的最小值，确保上下文压缩逻辑
+    对最短窗口的模型也安全。
+    """
     provider: LLMProvider
     model: str
     context_window_tokens: int
@@ -35,13 +46,22 @@ def _make_provider_core(
     preset: ModelPresetConfig | None = None,
     model: str | None = None,
 ) -> LLMProvider:
-    """Create a plain LLM provider without failover wrapping."""
+    """Create a plain LLM provider without failover wrapping.
+
+    创建不带故障转移包装的「裸」provider。核心流程：
+    1. 解析 preset 得到模型名与 provider 配置；
+    2. 通过 registry 的 find_by_name 找到 ProviderSpec（含 backend 类型）；
+    3. 校验必需配置（api_base / api_key）；
+    4. 按 backend 分发到具体 provider 实现类（延迟导入以避免加载未使用的依赖）。
+    """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     model = model or resolved.model
     provider_name = config.get_provider_name(model, preset=resolved)
     p = config.get_provider(model, preset=resolved)
     spec = find_by_name(provider_name) if provider_name else None
     if provider_name and not spec and p:
+        # 配置里出现了 registry 未登记的 provider 名：若提供了 api_base 则当作
+        # 动态（自定义）OpenAI 兼容端点处理。
         if not p.api_base:
             raise ValueError(f"Provider '{provider_name}' requires api_base in config.")
         spec = create_dynamic_spec(provider_name)
@@ -59,13 +79,16 @@ def _make_provider_core(
         and not spec.default_api_base
         and not (p and p.api_base)
     ):
+        # 直连型 provider（如 custom）必须由用户提供 api_base。
         raise ValueError(f"Provider '{provider_name}' requires api_base in config.")
     elif backend == "openai_compat" and not model.startswith("bedrock/"):
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
+            # 非 OAuth / 非本地 / 非直连的 provider 必须配置 API key。
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
+    # 按 backend 类型延迟导入并实例化对应的 provider 实现。
     if backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
@@ -116,7 +139,7 @@ def _make_provider_core(
             extra_query=p.extra_query if p else None,
         )
 
-    provider.generation = resolved.to_generation_settings()
+    provider.generation = resolved.to_generation_settings()  # 注入生成参数（max_tokens/temperature 等）
     return provider
 
 
@@ -124,6 +147,7 @@ def _inline_fallback_preset(
     primary: ModelPresetConfig,
     fallback: InlineFallbackConfig,
 ) -> ModelPresetConfig:
+    """将内联 fallback 配置补全为完整 preset：缺失字段从主模型 preset 继承。"""
     return ModelPresetConfig(
         model=fallback.model,
         provider=fallback.provider,
@@ -167,6 +191,8 @@ def make_provider(
     fallback_presets = _resolve_fallback_presets(config, resolved)
 
     if fallback_presets:
+        # 用 FallbackProvider 包装：factory 闭包负责按 fallback preset 创建
+        # 「裸」provider（不会再递归包装一层 fallback，避免无限嵌套）。
         provider = FallbackProvider(
             primary=provider,
             fallback_presets=fallback_presets,
@@ -184,7 +210,12 @@ def provider_signature(
     preset_name: str | None = None,
     preset: ModelPresetConfig | None = None,
 ) -> tuple[object, ...]:
-    """Return the config fields that affect the active provider chain."""
+    """Return the config fields that affect the active provider chain.
+
+    返回影响 provider 链的所有配置字段组成的元组，用于检测配置是否变化：
+    若签名改变则需重建 provider 快照。包含主模型与所有 fallback 的模型名、
+    provider、api_key、api_base、生成参数等。
+    """
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     p = config.get_provider(resolved.model, preset=resolved)
     fallback_presets = _resolve_fallback_presets(config, resolved)
@@ -243,6 +274,8 @@ def build_provider_snapshot(
     return ProviderSnapshot(
         provider=make_provider(config, preset=resolved),
         model=resolved.model,
+        # 上下文窗口取主模型与所有 fallback 中的最小值，保证压缩逻辑对
+        # 窗口最短的模型也安全。
         context_window_tokens=min([resolved.context_window_tokens, *fallback_windows]),
         signature=provider_signature(config, preset=resolved),
     )

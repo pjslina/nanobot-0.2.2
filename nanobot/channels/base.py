@@ -1,4 +1,8 @@
-"""Base channel interface for chat platforms."""
+"""Base channel interface for chat platforms.
+
+所有平台渠道（Telegram、Discord、Slack 等）的抽象基类，定义了与
+nanobot 消息总线对接的统一生命周期与消息收发协议。
+"""
 
 from __future__ import annotations
 
@@ -24,6 +28,9 @@ class BaseChannel(ABC):
 
     Each channel (Telegram, Discord, etc.) should implement this interface
     to integrate with the nanobot message bus.
+
+    渠道抽象基类：定义连接平台、监听消息、发送回复、流式输出与
+    权限校验的标准接口。子类只需实现 start/stop/send 等核心方法。
     """
 
     name: str = "base"
@@ -68,6 +75,9 @@ class BaseChannel(ABC):
 
         Returns True if already authenticated or login succeeds.
         Override in subclasses that support interactive login.
+
+        执行渠道特定的交互式登录（如扫码）。默认返回 True，表示无需登录；
+        需要扫码/验证码等交互登录的子类应重写此方法。
         """
         return True
 
@@ -80,12 +90,18 @@ class BaseChannel(ABC):
         1. Connects to the chat platform
         2. Listens for incoming messages
         3. Forwards messages to the bus via _handle_message()
+
+        渠道启动入口：必须为长期运行的异步任务，连接平台、监听消息，
+        并通过 _handle_message() 将消息转发到消息总线。
         """
         pass
 
     @abstractmethod
     async def stop(self) -> None:
-        """Stop the channel and clean up resources."""
+        """Stop the channel and clean up resources.
+
+        停止渠道并清理资源（连接、会话等）。
+        """
         pass
 
     @abstractmethod
@@ -98,6 +114,9 @@ class BaseChannel(ABC):
 
         Implementations should raise on delivery failure so the channel manager
         can apply any retry policy in one place.
+
+        发送完整消息。实现方应在投递失败时抛出异常，以便
+        ChannelManager 统一执行重试策略。
         """
         pass
 
@@ -110,6 +129,10 @@ class BaseChannel(ABC):
         Streaming contract: ``_stream_delta`` is a chunk, ``_stream_end`` ends
         the current segment, and stateful implementations must key buffers by
         ``_stream_id`` rather than only by ``chat_id``.
+
+        流式文本分块投递。子类重写此方法以启用流式输出。
+        流式协议：``_stream_delta`` 表示一个分块，``_stream_end`` 表示
+        当前片段结束；有状态的实现应按 ``_stream_id`` 而非仅 ``chat_id`` 维护缓冲区。
         """
         pass
 
@@ -175,13 +198,23 @@ class BaseChannel(ABC):
 
     @property
     def supports_streaming(self) -> bool:
-        """True when config enables streaming AND this subclass implements send_delta."""
+        """True when config enables streaming AND this subclass implements send_delta.
+
+        当且仅当配置启用流式输出且子类重写了 send_delta 时返回 True。
+        """
         cfg = self.config
         streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
     def is_allowed(self, sender_id: str) -> bool:
-        """Check sender permission: star > allowlist > pairing store > deny."""
+        """Check sender permission: star > allowlist > pairing store > deny.
+
+        发送者权限校验，优先级依次为：
+        1. allow_from 含 "*" -> 允许所有人；
+        2. allow_from 精确匹配 -> 允许；
+        3. 配对存储（pairing store）中已批准 -> 允许；
+        4. 其余一律拒绝。
+        """
         if isinstance(self.config, dict):
             allow_list = self.config.get("allow_from") or self.config.get("allowFrom") or []
         else:

@@ -6,6 +6,11 @@ Adding a new provider:
   2. Add a field to ProvidersConfig in config/schema.py.
   Done. Env vars, config matching, status display all derive from here.
 
+提供方注册表：所有 LLM 提供方的元数据（ProviderSpec）集中定义在此。
+新增 provider 只需两步：1) 在下面 PROVIDERS 元组中加一条 ProviderSpec；
+2) 在 config/schema.py 的 ProvidersConfig 中加对应字段。环境变量、配置匹配、
+状态展示等逻辑都从此注册表派生。
+
 Order matters — it controls match priority and fallback. Gateways first.
 Every entry writes out all fields so you can copy-paste as a template.
 """
@@ -22,35 +27,39 @@ from pydantic.alias_generators import to_snake
 class ProviderSpec:
     """One LLM provider's metadata. See PROVIDERS below for real examples.
 
+    单个 LLM 提供方的元数据描述。定义了如何识别该 provider（关键词/env_key/
+    api_key 前缀）、使用哪个 backend 实现、各家 API 的差异（思考模式开关、
+    reasoning_effort 映射、是否支持 prompt caching 等）。
+
     Placeholders in env_extras values:
       {api_key}  — the user's API key
       {api_base} — api_base from config, or this spec's default_api_base
     """
 
-    # identity
-    name: str  # config field name, e.g. "dashscope"
-    keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)
-    env_key: str  # env var for API key, e.g. "DASHSCOPE_API_KEY"
-    display_name: str = ""  # shown in `nanobot status`
+    # identity 身份标识
+    name: str  # config field name, e.g. "dashscope"  配置字段名
+    keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)  用于按模型名匹配的关键词
+    env_key: str  # env var for API key, e.g. "DASHSCOPE_API_KEY"  API key 对应的环境变量名
+    display_name: str = ""  # shown in `nanobot status`  在状态展示中显示的名称
 
-    # which provider implementation to use
+    # which provider implementation to use 使用哪个 provider 实现
     # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "github_copilot" | "bedrock"
     backend: str = "openai_compat"
 
     # extra env vars, e.g. (("ZHIPUAI_API_KEY", "{api_key}"),)
     env_extras: tuple[tuple[str, str], ...] = ()
 
-    # gateway / local detection
-    is_gateway: bool = False  # routes any model (OpenRouter, AiHubMix)
-    is_local: bool = False  # local deployment (vLLM, Ollama)
-    detect_by_key_prefix: str = ""  # match api_key prefix, e.g. "sk-or-"
-    detect_by_base_keyword: str = ""  # match substring in api_base URL
-    default_api_base: str = ""  # OpenAI-compatible base URL for this provider
+    # gateway / local detection 网关/本地部署检测方式
+    is_gateway: bool = False  # routes any model (OpenRouter, AiHubMix)  网关型，可路由任意模型
+    is_local: bool = False  # local deployment (vLLM, Ollama)  本地部署
+    detect_by_key_prefix: str = ""  # match api_key prefix, e.g. "sk-or-"  按 api_key 前缀匹配
+    detect_by_base_keyword: str = ""  # match substring in api_base URL  按 api_base URL 子串匹配
+    default_api_base: str = ""  # OpenAI-compatible base URL for this provider  默认 API base URL
 
-    # gateway behavior
-    strip_model_prefix: bool = False  # strip "provider/" before sending to gateway
-    strip_model_prefixes: tuple[str, ...] = ()  # strip only when the first model segment matches
-    supports_max_completion_tokens: bool = False
+    # gateway behavior 网关行为配置
+    strip_model_prefix: bool = False  # strip "provider/" before sending to gateway  发送前去掉模型名前缀
+    strip_model_prefixes: tuple[str, ...] = ()  # strip only when the first model segment matches  仅当首段匹配时去前缀
+    supports_max_completion_tokens: bool = False  # 是否支持 max_completion_tokens 参数
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
@@ -73,9 +82,10 @@ class ProviderSpec:
     #                   (DeepSeek, VolcEngine, BytePlus)
     # "enable_thinking" — {"enable_thinking": true/false}  (DashScope)
     # "reasoning_split" — {"reasoning_split": true/false}  (MiniMax)
-    thinking_style: str = ""
+    thinking_style: str = ""  # 思考模式开关的 extra_body 格式（各家 API 不同）
 
     # Gateway-native reasoning control to pair with model-level thinking styles.
+    # 网关级推理控制，与上面的 thinking_style 配合使用。
     # "reasoning_effort" — {"reasoning": {"effort": <none|minimal|...>}}
     #                      (OpenRouter)
     gateway_reasoning_style: str = ""
@@ -582,7 +592,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 
 def find_by_name(name: str) -> ProviderSpec | None:
-    """Find a provider spec by config field name, e.g. "dashscope"."""
+    """Find a provider spec by config field name, e.g. "dashscope".
+
+    按配置字段名查找 ProviderSpec。名字会先归一化为 snake_case。
+    """
     normalized = to_snake(name.replace("-", "_"))
     for spec in PROVIDERS:
         if spec.name == normalized:
@@ -591,7 +604,11 @@ def find_by_name(name: str) -> ProviderSpec | None:
 
 
 def create_dynamic_spec(name: str) -> ProviderSpec:
-    """Create a dynamic ProviderSpec for custom user-defined providers."""
+    """Create a dynamic ProviderSpec for custom user-defined providers.
+
+    为用户自定义 provider 创建动态 ProviderSpec（未在注册表中登记的）。
+    标记为 is_direct，并设置 strip_model_prefixes 以去掉模型名中的 provider 前缀。
+    """
     normalized = to_snake(name.replace("-", "_"))
     strip_prefixes = tuple(dict.fromkeys((name, normalized)))
     return ProviderSpec(

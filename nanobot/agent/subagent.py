@@ -1,4 +1,10 @@
-"""Subagent manager for background task execution."""
+"""Subagent manager for background task execution.
+
+子 agent 管理器：让主 agent 把独立子任务派生为"后台子 agent"并发执行。
+每个子 agent 拥有独立的工具注册表、文件状态、系统提示，复用同一个 provider/runner。
+子 agent 在后台 asyncio 任务中运行，完成后通过消息总线把结果作为"注入事件"
+送回主 agent 的待处理队列（mid-turn 注入），从而不与主 turn 竞争。
+"""
 
 import asyncio
 import json
@@ -31,7 +37,7 @@ from nanobot.utils.prompt_templates import render_template
 
 @dataclass(slots=True)
 class SubagentStatus:
-    """Real-time status of a running subagent."""
+    """Real-time status of a running subagent. 运行中子 agent 的实时状态。"""
 
     task_id: str
     label: str
@@ -46,7 +52,11 @@ class SubagentStatus:
 
 
 class _SubagentHook(AgentHook):
-    """Hook for subagent execution — logs tool calls and updates status."""
+    """Hook for subagent execution — logs tool calls and updates status.
+
+    子 agent 执行钩子：记录工具调用日志，并在每轮迭代后更新 SubagentStatus
+    （迭代数、工具事件、用量、错误），供外部查询子 agent 进度。
+    """
 
     def __init__(self, task_id: str, status: SubagentStatus | None = None) -> None:
         super().__init__()
@@ -72,7 +82,7 @@ class _SubagentHook(AgentHook):
 
 
 class SubagentManager:
-    """Manages background subagent execution."""
+    """Manages background subagent execution. 管理后台子 agent 的执行。"""
 
     def __init__(
         self,
@@ -159,7 +169,12 @@ class SubagentManager:
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        派生一个子 agent 在后台执行任务：创建 task_id 与 SubagentStatus，
+        用 asyncio.create_task 启动后台任务，并注册清理回调（任务结束后移除状态）。
+        返回给主 agent 的提示文本（告知已启动、完成时会通知）。
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
@@ -172,6 +187,7 @@ class SubagentManager:
         )
         self._task_statuses[task_id] = status
 
+        # 以后台任务形式运行子 agent，不阻塞主 turn。
         bg_task = asyncio.create_task(
             self._run_subagent(
                 task_id,
@@ -189,6 +205,7 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
+            # 任务结束后清理运行状态与按会话的索引。
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -212,7 +229,11 @@ class SubagentManager:
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """Execute the subagent task and announce the result.
+
+        执行子 agent 任务并广播结果：构建独立工具注册表与系统提示，用 runner.run 跑完
+        子 agent 的 LLM 对话循环，然后按停止原因（成功/工具错误/异常）把结果广播回主 agent。
+        """
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         async def _on_checkpoint(payload: dict) -> None:
@@ -309,10 +330,10 @@ class SubagentManager:
         )
 
         # Inject as system message to trigger main agent.
-        # Use session_key_override to align with the main agent's effective
-        # session key (which accounts for unified sessions) so the result is
-        # routed to the correct pending queue (mid-turn injection) instead of
-        # being dispatched as a competing independent task.
+        # 用 session_key_override 对齐主 agent 的有效会话 key（考虑统一会话），
+        # 这样结果会被路由到正确的待处理队列（mid-turn 注入），而不是作为一个
+        # 竞争性的独立任务被分发。
+        # 作为系统消息注入，以触发主 agent 处理。
         override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         metadata: dict[str, Any] = {
             "injected_event": "subagent_result",

@@ -1,4 +1,8 @@
-"""Spawn tool for creating background subagents."""
+"""Spawn tool for creating background subagents.
+
+子 agent 派生工具：将独立任务委派给后台子 agent 异步执行。
+子 agent 拥有独立上下文，完成后向父 agent 回报结果。
+"""
 
 from __future__ import annotations
 
@@ -31,10 +35,16 @@ if TYPE_CHECKING:
     )
 )
 class SpawnTool(Tool, ContextAware):
-    """Tool to spawn a subagent for background task execution."""
+    """Tool to spawn a subagent for background task execution.
+
+    派生子 agent 执行后台任务的工具。通过 SubagentManager 管理子 agent 生命周期，
+    受 max_concurrent_subagents 并发上限约束。使用 ContextVar 传递来源频道/会话信息，
+    确保子 agent 回报时能路由到正确的父会话。
+    """
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
+        # ContextVar 保存派生请求的来源上下文，使子 agent 完成后能回报到正确的频道/会话。
         self._origin_channel: ContextVar[str] = ContextVar("spawn_origin_channel", default="cli")
         self._origin_chat_id: ContextVar[str] = ContextVar("spawn_origin_chat_id", default="direct")
         self._session_key: ContextVar[str] = ContextVar("spawn_session_key", default="cli:direct")
@@ -75,7 +85,11 @@ class SpawnTool(Tool, ContextAware):
         temperature: float | None = None,
         **kwargs: Any,
     ) -> str:
-        """Spawn a subagent to execute the given task."""
+        """Spawn a subagent to execute the given task.
+
+        派生子 agent 执行给定任务。先检查并发上限，超限则拒绝并提示等待。
+        通过 current_workspace_scope() 继承父 agent 的工作区访问边界。
+        """
         running = self._manager.get_running_count()
         limit = self._manager.max_concurrent_subagents
         if running >= limit:

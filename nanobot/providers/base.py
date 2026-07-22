@@ -1,4 +1,10 @@
-"""Base LLM provider interface."""
+"""Base LLM provider interface.
+
+LLM 提供方抽象基类模块：定义所有 provider（Anthropic / OpenAI 兼容 / Azure /
+Bedrock 等）的统一接口。屏蔽各厂商 API 在消息格式、工具调用格式、流式协议上的
+差异，对上层 AgentRunner 暴露一致的 chat / chat_stream / 工具调用 / 用量统计契约。
+本模块还内建可重试错误识别、指数退避、Retry-After 解析与流式断流恢复等通用策略。
+"""
 
 import asyncio
 import json
@@ -15,9 +21,11 @@ from typing import Any
 import json_repair
 from loguru import logger
 
+# 流式响应空闲超时相关配置：通过环境变量 NANOBOT_STREAM_IDLE_TIMEOUT_S 可调。
+# 当流式响应两个 chunk 之间长时间无数据时，视为连接卡死并触发重试。
 STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
-DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
-MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
+DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0  # 默认空闲超时 90 秒
+MAX_STREAM_IDLE_TIMEOUT_S = 3600.0  # 上限 1 小时，防止用户误配过大值
 
 
 def resolve_stream_idle_timeout_s(
@@ -26,7 +34,11 @@ def resolve_stream_idle_timeout_s(
     default: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
     maximum: float = MAX_STREAM_IDLE_TIMEOUT_S,
 ) -> float:
-    """Return a safe streaming idle timeout from env/config text."""
+    """Return a safe streaming idle timeout from env/config text.
+
+    将环境变量/配置中的文本解析为安全的流式空闲超时秒数。
+    对非法值、非正值、超上限值做兜底处理，保证最终返回一个可用数值。
+    """
     raw = os.environ.get(STREAM_IDLE_TIMEOUT_ENV) if env_value is None else env_value
     if raw is None or not raw.strip():
         return default
@@ -46,7 +58,12 @@ def resolve_stream_idle_timeout_s(
 
 @dataclass
 class ToolCallRequest:
-    """A tool call request from the LLM."""
+    """A tool call request from the LLM.
+
+    LLM 返回的一次工具调用请求的统一表示。各 provider 将自家格式的工具调用
+    （OpenAI 的 tool_calls、Anthropic 的 tool_use block 等）归一化为该结构。
+    extra_content / provider_specific_fields 保留厂商特有字段，便于回放历史。
+    """
     id: str
     name: str
     arguments: Any
@@ -55,7 +72,11 @@ class ToolCallRequest:
     function_provider_specific_fields: dict[str, Any] | None = None
 
     def to_openai_tool_call(self) -> dict[str, Any]:
-        """Serialize to an OpenAI-style tool_call payload."""
+        """Serialize to an OpenAI-style tool_call payload.
+
+        序列化为 OpenAI 风格的 tool_call 字典，供历史回放或跨 provider 传递使用。
+        非字符串参数会先 JSON 序列化，保证 arguments 始终为字符串。
+        """
         arguments = (
             self.arguments
             if isinstance(self.arguments, str)
@@ -81,9 +102,10 @@ class ToolCallRequest:
 def parse_tool_arguments(arguments: Any) -> Any:
     """Parse provider tool arguments without guessing executable parameters.
 
-    Valid JSON object strings become dicts. Empty strings become no-arg calls.
-    Malformed JSON and JSON array/scalar values are preserved so ToolRegistry
-    can reject them before execution.
+    解析 provider 返回的工具参数，用于"即将执行"的工具调用。
+    刻意不做容错修复：合法 JSON 对象字符串转 dict，空字符串视为无参调用，
+    畸形 JSON / JSON 数组 / 标量原样保留，交由 ToolRegistry 在执行前拒绝。
+    这样避免把模型生成的错误参数"猜"成可执行参数而引发意外行为。
     """
     if arguments is None:
         return {}
@@ -104,9 +126,9 @@ def parse_tool_arguments(arguments: Any) -> Any:
 def tool_arguments_object_for_replay(arguments: Any) -> dict[str, Any]:
     """Return object-shaped arguments for provider history replay only.
 
-    This compatibility path may repair malformed JSON because it only shapes
-    existing conversation history for provider protocols. Do not use it for
-    newly generated tool calls that are about to execute.
+    仅用于"历史回放"（把对话历史发回 provider）时的参数整形。
+    与 parse_tool_arguments 不同，这里可以用 json_repair 容错修复畸形 JSON，
+    因为只是把已有历史重新塞进请求体，不会被执行。不要用于新生成的工具调用。
     """
     if arguments is None:
         return {}
@@ -136,7 +158,13 @@ def tool_arguments_json_for_replay(arguments: Any) -> str:
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM provider."""
+    """Response from an LLM provider.
+
+    一次 LLM 调用的统一响应结构。content 为文本回复，tool_calls 为工具调用列表。
+    除正常内容外，还携带错误元数据（error_status_code / error_kind / error_code 等），
+    供重试策略与 FallbackProvider 判断是否为可重试/可回退错误。reasoning_content
+    与 thinking_blocks 分别兼容 DeepSeek-Kimi 系与 Anthropic 扩展思考协议。
+    """
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
@@ -145,6 +173,7 @@ class LLMResponse:
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
     # Structured error metadata used by retry policy when finish_reason == "error".
+    # 当 finish_reason == "error" 时，以下字段供重试策略判断错误性质：
     error_status_code: int | None = None
     error_kind: str | None = None  # e.g. "timeout", "connection"
     error_type: str | None = None  # Provider/type semantic, e.g. insufficient_quota.
@@ -160,7 +189,11 @@ class LLMResponse:
     @property
     def should_execute_tools(self) -> bool:
         """Tools execute only when has_tool_calls AND finish_reason is a tool-capable stop.
-        Blocks gateway-injected calls under ``refusal`` / ``content_filter`` / ``error`` (#3220)."""
+        Blocks gateway-injected calls under ``refusal`` / ``content_filter`` / ``error`` (#3220).
+
+        仅当存在工具调用且 finish_reason 属于可执行工具的停止原因时才执行工具。
+        对 refusal / content_filter / error 等原因显式拦截，避免网关注入的调用被误执行。
+        """
         if not self.has_tool_calls:
             return False
         return self.finish_reason in ("tool_calls", "function_call", "stop")
@@ -168,7 +201,11 @@ class LLMResponse:
 
 @dataclass(frozen=True)
 class GenerationSettings:
-    """Default generation settings."""
+    """Default generation settings.
+
+    生成参数默认值（温度/最大 token/推理力度）。由 preset 配置注入到 provider，
+    供 chat_with_retry / chat_stream_with_retry 在调用方未显式传参时回退使用。
+    """
 
     temperature: float = 0.7
     max_tokens: int = 4096
@@ -179,14 +216,21 @@ _SYNTHETIC_USER_CONTENT = "(conversation continued)"
 
 
 class LLMProvider(ABC):
-    """Base class for LLM providers."""
+    """Base class for LLM providers.
+
+    所有 LLM 提供方的抽象基类。子类需实现 chat / chat_stream / get_default_model。
+    本基类内建跨厂商通用能力：消息清洗、角色交替规整、工具调用归一化、
+    瞬时错误识别、指数退避重试、Retry-After 解析、流式断流恢复、图片降级等。
+    """
 
     supports_progress_deltas = False
 
-    _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _PERSISTENT_MAX_DELAY = 60
-    _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
-    _RETRY_HEARTBEAT_CHUNK = 30
+    # 重试策略相关常量
+    _CHAT_RETRY_DELAYS = (1, 2, 4)  # 标准模式三次重试的退避秒数
+    _PERSISTENT_MAX_DELAY = 60  # persistent 模式单次最长等待
+    _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10  # 连续相同错误达此次数则停止 persistent 重试
+    _RETRY_HEARTBEAT_CHUNK = 30  # 重试等待时每 30 秒发一次心跳回调，便于 UI 提示
+    # 瞬时错误文本标记（含中英文），命中其一即视为可重试
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -205,6 +249,7 @@ class LLMProvider(ABC):
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
+    # 不可重试的 429 语义 token：配额耗尽/欠费/余额不足等，重试也不会成功
     _NON_RETRYABLE_429_ERROR_TOKENS = frozenset({
         "insufficient_quota",
         "quota_exceeded",
@@ -223,6 +268,7 @@ class LLMProvider(ABC):
         "requests_limit_exceeded",
         "overloaded_error",
     })
+    # 不可重试的 429 文本标记（配额/计费类），在错误正文里匹配
     _NON_RETRYABLE_429_TEXT_MARKERS = (
         "insufficient_quota",
         "insufficient quota",
@@ -239,6 +285,7 @@ class LLMProvider(ABC):
         "out of quota",
         "exceeded your current quota",
     )
+    # 可重试的 429 文本标记（限流/过载类），命中则重试
     _RETRYABLE_429_TEXT_MARKERS = (
         "rate limit",
         "rate_limit",
@@ -260,7 +307,13 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Sanitize message content: fix empty blocks, strip internal _meta fields."""
+        """Sanitize message content: fix empty blocks, strip internal _meta fields.
+
+        清洗消息内容：修复空内容块、移除内部 _meta 字段，避免 provider 因空内容报错。
+        - 空字符串 content：assistant 带 tool_calls 时改 None，否则用 "(empty)" 占位。
+        - 列表内容中空的 text/input_text/output_text 块会被丢弃。
+        - dict 形 content 会被包成单元素列表以统一形态。
+        """
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
@@ -322,7 +375,12 @@ class LLMProvider(ABC):
 
     @classmethod
     def _tool_cache_marker_indices(cls, tools: list[dict[str, Any]]) -> list[int]:
-        """Return cache marker indices: builtin/MCP boundary and tail index."""
+        """Return cache marker indices: builtin/MCP boundary and tail index.
+
+        返回工具列表中用于"提示词缓存断点"的索引：内置工具与 MCP 工具的边界、
+        以及列表末尾。Anthropic 等支持 prompt caching 的 provider 据此插入缓存断点，
+        使工具定义部分能在多轮对话中复用缓存。
+        """
         if not tools:
             return []
 
@@ -344,7 +402,11 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         allowed_keys: frozenset[str],
     ) -> list[dict[str, Any]]:
-        """Keep only provider-safe message keys and normalize assistant content."""
+        """Keep only provider-safe message keys and normalize assistant content.
+
+        按 provider 允许的 key 集合过滤消息，移除厂商不识别的字段；
+        同时给缺少 content 的 assistant 消息补上 content=None，满足协议要求。
+        """
         sanitized = []
         for msg in messages:
             clean = {k: v for k, v in msg.items() if k in allowed_keys}
@@ -367,6 +429,10 @@ class LLMProvider(ABC):
         """
         Send a chat completion request.
 
+        发送一次（非流式）对话补全请求。这是 provider 最核心的抽象方法，
+        各子类把统一参数翻译为自家厂商的 HTTP/SDK 调用，再把响应归一化为 LLMResponse。
+        tools 为工具定义列表，tool_choice 控制工具选择策略（auto/required/指定工具）。
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -387,7 +453,14 @@ class LLMProvider(ABC):
 
     @classmethod
     def _is_transient_response(cls, response: LLMResponse) -> bool:
-        """Prefer structured error metadata, fallback to text markers for legacy providers."""
+        """Prefer structured error metadata, fallback to text markers for legacy providers.
+
+        判断响应是否为"瞬时错误"（可重试）。优先用结构化错误元数据判断：
+        1. error_should_retry 显式给出则直接采用；
+        2. HTTP 状态码判断（429 单独细分，408/409/5xx 可重试）；
+        3. error_kind 属 timeout/connection 视为瞬时；
+        4. 最后回退到正文文本标记匹配（兼容旧 provider）。
+        """
         if response.error_should_retry is not None:
             return bool(response.error_should_retry)
 
@@ -408,9 +481,9 @@ class LLMProvider(ABC):
     def is_arrearage_response(cls, response: LLMResponse) -> bool:
         """Detect API-key arrearage / quota / billing errors that won't clear on retry.
 
-        These surface as HTTP 402 or as billing semantic tokens (e.g.
-        ``insufficient_quota``, ``payment_required``); reuses the same token and
-        text markers the 429 retry policy treats as non-retryable.
+        检测欠费/配额/计费类错误（HTTP 402 或 insufficient_quota/payment_required 等语义）。
+        这类错误重试无意义，调用方可据此切换 provider 或提示用户充值。
+        复用 429 重试策略中"不可重试"的 token 与文本标记集合。
         """
         if response.error_status_code is not None and int(response.error_status_code) == 402:
             return True
@@ -462,6 +535,8 @@ class LLMProvider(ABC):
 
     @classmethod
     def _is_retryable_429_response(cls, response: LLMResponse) -> bool:
+        # 429 细分：先排除配额/计费类（不可重试），再匹配限流/过载类（可重试）。
+        # 未知语义的 429 默认可重试（WATT+retry），宁可多试一次也不漏掉临时限流。
         type_token = cls._normalize_error_token(response.error_type)
         code_token = cls._normalize_error_token(response.error_code)
         semantic_tokens = {
@@ -486,9 +561,14 @@ class LLMProvider(ABC):
     def _enforce_role_alternation(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Merge consecutive same-role messages and drop trailing assistant messages.
 
-        Some providers (OpenAI-compat, Azure, vLLM, Ollama, etc.) reject requests
-        where the last message is 'assistant' (prefill not supported) or two
-        consecutive non-system messages share the same role.
+        规整消息序列以满足部分 provider 的协议约束：
+        - OpenAI 兼容/Azure/vLLM/Ollama 等不接受最后一条为 assistant（不支持 prefill），
+          也不接受连续两条同角色（user/assistant）消息。
+        - 处理：合并连续同角色 user/assistant 的文本；带 tool_calls 的 assistant
+          特殊处理避免覆盖；丢弃尾部多余 assistant；若丢弃后只剩 system 消息则把
+          最后一条 assistant 转成 user 以保证请求合法。
+        - 兜底：若首条非 system 消息是裸 assistant（上游截断所致），插入一条合成
+          user 消息，避免 GLM 等 provider 报错（如 1214）。
         """
         if not messages:
             return messages
@@ -553,7 +633,11 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-        """Replace image_url blocks with text placeholder. Returns None if no images found."""
+        """Replace image_url blocks with text placeholder. Returns None if no images found.
+
+        把消息中的 image_url 块替换为文本占位符，返回新列表；无图片则返回 None。
+        用于非瞬时错误时降级重试：某些错误由图片触发，去掉图片后重试可能成功。
+        """
         found = False
         result = []
         for msg in messages:

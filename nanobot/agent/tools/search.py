@@ -1,4 +1,8 @@
-"""Search tools: file discovery and grep."""
+"""Search tools: file discovery and grep.
+
+搜索工具：find_files（按路径片段/glob/类型查找文件）与 grep（按正则搜索文件内容）。
+均受工作区访问策略约束，自动跳过依赖/构建目录和二进制文件。
+"""
 
 from __future__ import annotations
 

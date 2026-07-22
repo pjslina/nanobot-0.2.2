@@ -1,4 +1,9 @@
-"""Skills loader for agent capabilities."""
+"""Skills loader for agent capabilities.
+
+技能加载器。"技能"（skill）是教 agent 如何使用特定工具或完成特定任务的 Markdown
+文件（SKILL.md），可来自工作区 skills 目录或内置 skills 目录。加载后技能内容会注入
+系统提示，让模型掌握相应能力。工作区技能优先于同名内置技能，可在配置中禁用指定技能。
+"""
 
 import json
 import os
@@ -9,9 +14,11 @@ from pathlib import Path
 import yaml
 
 # Default builtin skills directory (relative to this file)
+# 内置技能目录（本文件上一级的 skills 目录）。
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 # Opening ---, YAML body (group 1), closing --- on its own line; supports CRLF.
+# 匹配 SKILL.md 顶部的 YAML front matter（--- 包裹的元数据块），用于剥离后取正文。
 _STRIP_SKILL_FRONTMATTER = re.compile(
     r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?",
     re.DOTALL,
@@ -22,15 +29,17 @@ class SkillsLoader:
     """
     Loader for agent skills.
 
+    技能加载器。技能是教 agent 如何使用特定工具或完成特定任务的 Markdown 文件（SKILL.md）。
+
     Skills are markdown files (SKILL.md) that teach the agent how to use
     specific tools or perform certain tasks.
     """
 
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None, disabled_skills: set[str] | None = None):
         self.workspace = workspace
-        self.workspace_skills = workspace / "skills"
-        self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
-        self.disabled_skills = disabled_skills or set()
+        self.workspace_skills = workspace / "skills"  # 工作区技能目录（用户自定义，优先）
+        self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR  # 内置技能目录
+        self.disabled_skills = disabled_skills or set()  # 被禁用的技能名集合
 
     def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
         if not base.exists():
@@ -52,6 +61,9 @@ class SkillsLoader:
         """
         List all available skills.
 
+        列出所有可用技能。先收集工作区技能，再补充内置技能（同名时工作区优先覆盖），
+        过滤掉被禁用的，并可选地过滤掉依赖未满足的技能。
+
         Args:
             filter_unavailable: If True, filter out skills with unmet requirements.
 
@@ -60,6 +72,7 @@ class SkillsLoader:
         """
         skills = self._skill_entries_from_dir(self.workspace_skills, "workspace")
         workspace_names = {entry["name"] for entry in skills}
+        # 工作区技能优先：收集内置技能时跳过与工作区同名的。
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
                 self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)

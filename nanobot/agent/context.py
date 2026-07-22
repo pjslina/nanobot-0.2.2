@@ -1,4 +1,9 @@
-"""Context builder for assembling agent prompts."""
+"""Context builder for assembling agent prompts.
+
+负责构建发送给 LLM 的上下文：将系统提示、身份信息、引导文件、记忆、
+技能摘要、历史记录与用户消息（含运行时元数据）组装成完整的消息列表。
+这是 agent 核心模块之一，决定了模型每轮"看到"什么。
+"""
 
 import base64
 import mimetypes
@@ -23,12 +28,20 @@ from nanobot.utils.prompt_templates import render_template
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Return persisted kwargs for turn-attached capabilities."""
+    """Return persisted kwargs for turn-attached capabilities.
+
+    汇总各子系统需要在会话元数据中持久化的参数（CLI 应用与 MCP 工具），
+    供 turn 级能力在后续轮次恢复使用。
+    """
     return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
 
 
 def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
-    """Return model-visible runtime annotations for turn-attached capabilities."""
+    """Return model-visible runtime annotations for turn-attached capabilities.
+
+    返回会拼接到运行时上下文里的注解行：CLI 工具注解 + MCP 服务器连接状态注解，
+    让模型感知当前可用/已连接的 MCP 服务器等信息。
+    """
     return [
         *cli_app_utils.runtime_lines(msg, workspace, skip=skip),
         *mcp_tools.runtime_lines(
@@ -49,7 +62,12 @@ async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolReg
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """Builds the context (system prompt + messages) for the agent.
+
+    构建 agent 的上下文（系统提示 + 消息列表）。系统提示由身份、引导文件、
+    工具契约、记忆、技能、近期历史等部分拼装；消息列表则把历史与当前用户消息
+    （含运行时元数据块）合并。这是决定模型每轮"看到什么"的核心。
+    """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
@@ -73,7 +91,12 @@ class ContextBuilder:
         session_key: str | None = None,
         unified_session: bool = False,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        从身份、引导文件、记忆与技能拼装系统提示。各部分按顺序：
+        身份 -> 引导文件(AGENTS/SOUL/USER.md) -> 工具契约 -> 记忆 -> 常驻技能 ->
+        技能摘要 -> 近期历史(记忆巩固后的) -> 归档上下文摘要。各段以分隔线连接。
+        """
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
 
@@ -98,6 +121,7 @@ class ContextBuilder:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if include_memory_recent_history:
+            # 注入"近期历史"：自上次 dream 记忆巩固游标以来的历史条目，限量并截断 token。
             entries = self.memory.read_recent_history_for_prompt(
                 since_cursor=self.memory.get_last_dream_cursor(),
                 session_key=session_key,

@@ -1,4 +1,10 @@
-"""Provider wrapper that transparently fails over to fallback models on error."""
+"""Provider wrapper that transparently fails over to fallback models on error.
+
+主备切换 provider 包装器：主模型出错时透明地切换到备用模型继续服务。
+核心设计：故障转移是请求级的（wrapper 本身在多轮间无状态）；若内容已开始
+流式输出则跳过转移以避免重复输出（超时恢复除外）；主 provider 连续失败后
+触发熔断器，在冷却期内直接跳过主模型。
+"""
 
 from __future__ import annotations
 
@@ -11,9 +17,11 @@ from loguru import logger
 from nanobot.providers.base import LLMProvider, LLMResponse
 
 # Circuit breaker tuned to match OpenAICompatProvider's Responses API breaker.
+# 熔断器参数：主 provider 连续失败 3 次后熔断，冷却 60 秒。
 _PRIMARY_FAILURE_THRESHOLD = 3
 _PRIMARY_COOLDOWN_S = 60
 _MISSING = object()
+# 可触发故障转移的错误类型（超时/连接/服务器错误/限流/过载）
 _FALLBACK_ERROR_KINDS = frozenset({
     "timeout",
     "connection",
@@ -21,6 +29,8 @@ _FALLBACK_ERROR_KINDS = frozenset({
     "rate_limit",
     "overloaded",
 })
+# 不应触发故障转移的错误类型（认证/权限/内容过滤/拒绝/上下文超长/非法请求）
+# 这些错误在备用模型上同样会失败，转移只会浪费时间。
 _NON_FALLBACK_ERROR_KINDS = frozenset({
     "authentication",
     "auth",
@@ -150,6 +160,13 @@ class FallbackProvider(LLMProvider):
         has_streamed: list[bool] | None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        """执行主备切换的核心逻辑。
+
+        流程：1) 若主 provider 未熔断则先尝试主模型；2) 主模型出错时判断是否
+        可转移（_should_fallback），并处理「内容已流式输出」的特殊情况（超时
+        可在新流段中继续，其他错误跳过转移）；3) 依次尝试每个 fallback preset，
+        覆盖 model/max_tokens/temperature/reasoning_effort 参数；4) 熔断器计数。
+        """
         primary_model = kwargs.get("model") or self._primary.get_default_model()
         primary_was_attempted = False
         primary_error = "unknown error"
@@ -166,6 +183,8 @@ class FallbackProvider(LLMProvider):
             if has_streamed is not None and has_streamed[0]:
                 is_timeout = (response.error_kind or "").lower() == "timeout"
                 if is_timeout:
+                    # 超时特例：内容已部分输出但流卡住，允许在新流段中继续转移，
+                    # 由 on_stream_recover 回调通知上层关闭当前流段。
                     logger.warning(
                         "Primary model '{}' stream stalled after content was emitted; "
                         "attempting failover anyway",
@@ -177,6 +196,7 @@ class FallbackProvider(LLMProvider):
                     else:
                         kwargs["on_content_delta"] = None
                 else:
+                    # 非超时错误且内容已输出：跳过转移避免重复输出。
                     logger.warning(
                         "Primary model error but content already streamed; skipping failover"
                     )
@@ -192,6 +212,7 @@ class FallbackProvider(LLMProvider):
 
             self._primary_failures += 1
             if self._primary_failures >= _PRIMARY_FAILURE_THRESHOLD:
+                # 连续失败达到阈值，触发熔断：记录时间，冷却期内跳过主模型。
                 self._primary_tripped_at = time.monotonic()
                 logger.warning(
                     "Primary model '{}' circuit open after {} consecutive failures",
@@ -246,6 +267,7 @@ class FallbackProvider(LLMProvider):
                 name: kwargs.get(name, _MISSING)
                 for name in ("model", "max_tokens", "temperature", "reasoning_effort")
             }
+            # 用 fallback preset 的参数覆盖请求参数，尝试完毕后恢复原值。
             kwargs["model"] = fallback_model
             kwargs["max_tokens"] = fallback.max_tokens
             kwargs["temperature"] = fallback.temperature
@@ -291,6 +313,12 @@ class FallbackProvider(LLMProvider):
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:
+        """判断主模型错误是否应触发故障转移。
+
+        逻辑：4xx 中的 400/401/403/404/422（配置/认证问题）不转移；
+        非转移类错误类型不转移；显式标记 error_should_retry=True 则转移；
+        408/409/429/5xx 转移；匹配 _FALLBACK_ERROR_TOKENS 的文本也转移。
+        """
         if response.error_should_retry is False:
             return False
         status = response.error_status_code

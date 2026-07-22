@@ -1,4 +1,9 @@
-"""File system tools: read, write, edit, list."""
+"""File system tools: read, write, edit, list.
+
+文件系统工具集：提供 read_file / write_file / edit_file / list_dir 四个工具，
+让 agent 能够读取、写入、精确编辑、列出文件。所有文件操作都受工作区边界
+（restrict_to_workspace）约束，防止 agent 越权访问工作区之外的路径。
+"""
 
 import difflib
 import mimetypes
@@ -28,7 +33,10 @@ class FileToolsConfig(Base):
 
 
 class _FsTool(Tool):
-    """Shared base for filesystem tools — common init and path resolution."""
+    """Shared base for filesystem tools - common init and path resolution.
+
+    所有文件系统工具的共享基类：统一处理工作区路径解析、权限边界与文件状态跟踪。
+    """
 
     config_key = "file"
 
@@ -56,12 +64,15 @@ class _FsTool(Tool):
         self._allowed_dir = allowed_dir
         # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
         # must opt in via extra_write_allowed_dirs.
+        # 旧版别名：extra_allowed_dirs 仅授予读权限；需要写权限的工具必须通过
+        # extra_write_allowed_dirs 显式声明。
         self._extra_read_allowed_dirs = [
             *(extra_allowed_dirs or []),
             *(extra_read_allowed_dirs or []),
         ]
         self._extra_write_allowed_dirs = list(extra_write_allowed_dirs or [])
         self._extra_write_allowed_files = list(extra_write_allowed_files or [])
+        # restrict_to_workspace 未显式指定时，若设置了 allowed_dir 则默认启用边界限制
         self._restrict_to_workspace = (
             bool(restrict_to_workspace)
             if restrict_to_workspace is not None
@@ -71,6 +82,8 @@ class _FsTool(Tool):
         # Explicit state is used by isolated runners like Dream/subagents.
         # Main AgentLoop tools leave this unset and resolve state from the
         # current async task, which keeps shared tool instances session-safe.
+        # 显式文件状态用于 Dream/子 agent 等隔离运行器；主 AgentLoop 不设置此项，
+        # 而是从当前异步任务上下文解析状态，保证共享工具实例在多会话间安全。
         self._explicit_file_states = file_states
         self._fallback_file_states = FileStates()
 
@@ -120,11 +133,13 @@ class _FsTool(Tool):
         *,
         include_media_dir: bool,
     ) -> Path:
+        # 获取当前工具的工作区访问上下文（受 restrict_to_workspace 和沙箱策略影响）
         access = current_tool_workspace(
             self._workspace,
             restrict_to_workspace=self._restrict_to_workspace,
             sandbox_restricts_workspace=self._sandbox_restricts_workspace,
         )
+        # 将用户输入的路径规范化并校验是否落在允许的目录范围内
         return resolve_workspace_path(
             path,
             access.project_path,
@@ -135,6 +150,7 @@ class _FsTool(Tool):
         )
 
     def _resolve_read(self, path: str) -> Path:
+        # 读路径解析：允许访问额外只读目录和媒体目录
         return self._resolve_with_extra(
             path,
             self._extra_read_allowed_dirs,
@@ -143,6 +159,7 @@ class _FsTool(Tool):
         )
 
     def _resolve_write(self, path: str) -> Path:
+        # 写路径解析：仅允许额外写目录/写文件，不包含媒体目录
         return self._resolve_with_extra(
             path,
             self._extra_write_allowed_dirs,
@@ -168,14 +185,21 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     "/dev/tty", "/dev/console",
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
 })
+# 设备文件黑名单：读取这些文件会导致挂起或无限输出（如 /dev/zero、/dev/random），
+# 或读取标准输入/输出流造成混乱，因此必须在读取前拦截。
 
 
 def _is_blocked_device(path: str | Path) -> bool:
-    """Check if path is a blocked device that could hang or produce infinite output."""
+    """Check if path is a blocked device that could hang or produce infinite output.
+
+    检查路径是否为被屏蔽的设备文件，防止读取导致进程挂起或产生无限输出。
+    会解析符号链接以检查实际目标。
+    """
     import re
     raw = str(path)
 
     # Resolve symlinks to check the actual target
+    # 解析符号链接以检查实际指向的设备
     try:
         resolved = str(Path(raw).resolve())
     except (OSError, ValueError):
@@ -183,12 +207,14 @@ def _is_blocked_device(path: str | Path) -> bool:
 
     if raw in _BLOCKED_DEVICE_PATHS or resolved in _BLOCKED_DEVICE_PATHS:
         return True
+    # 拦截 /proc/<pid>/fd/0|1|2 形式的标准流描述符
     if re.match(r"/proc/\d+/fd/[012]$", raw) or re.match(r"/proc/self/fd/[012]$", raw):
         return True
     if re.match(r"/proc/\d+/fd/[012]$", resolved) or re.match(r"/proc/self/fd/[012]$", resolved):
         return True
 
     # Check if resolved path starts with /dev/ (covers symlinks to devices)
+    # 解析后路径以 /dev/ 开头则一律拦截（覆盖指向设备的符号链接）
     if resolved.startswith("/dev/"):
         return True
     return False
@@ -227,10 +253,14 @@ def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
     )
 )
 class ReadFileTool(_FsTool):
-    """Read file contents with optional line-based pagination."""
+    """Read file contents with optional line-based pagination.
+
+    读取文件内容，支持按行分页、PDF/Office 文档解析、图片识别。
+    内置去重机制：同一文件未修改时重复读取会返回简短提示，节省上下文。
+    """
     _scopes = {"core", "subagent", "memory"}
 
-    _MAX_CHARS = 128_000
+    _MAX_CHARS = 128_000  # 单次读取最大字符数，超出则截断
     _DEFAULT_LIMIT = 2000
     _MAX_PDF_PAGES = 20
 
@@ -271,6 +301,7 @@ class ReadFileTool(_FsTool):
                 return "Error reading file: Unknown path"
 
             # Device path blacklist
+            # 设备路径黑名单检查：防止读取 /dev/zero 等导致挂起
             if _is_blocked_device(path):
                 return f"Error: Reading {path} is blocked (device path that could hang or produce infinite output)."
 
@@ -300,6 +331,8 @@ class ReadFileTool(_FsTool):
 
             # Read dedup: same path + offset + limit + unchanged mtime → stub
             # Always check for external modifications before dedup
+            # 读取去重：相同路径+offset+limit 且 mtime 未变时返回简短提示。
+            # 但必须先检查外部修改，因为文件可能在两次读取间被其他进程改动。
             entry = self._file_states.get(fp)
             try:
                 current_mtime = os.path.getmtime(fp)
@@ -314,21 +347,25 @@ class ReadFileTool(_FsTool):
             ):
                 if current_mtime != entry.mtime:
                     # File was modified externally - force full read and mark as not dedupable
+                    # 文件被外部修改 → 标记为不可去重，重新记录状态，继续读取完整内容
                     entry.can_dedup = False
                     self._file_states.record_read(fp, offset=offset, limit=limit)  # Update state with new mtime
                     # Continue to read full content (don't return dedup message)
                 else:
                     # File unchanged - return dedup message
                     # But only if content is actually unchanged (not just mtime)
+                    # mtime 未变但仍需用内容哈希二次确认，防止 mtime 精度不足
                     current_hash = _hash_file(str(fp))
                     if current_hash == entry.content_hash:
                         return f"[File unchanged since last read: {path}]"
                     else:
                         # Content changed despite same mtime - force full read
+                        # mtime 相同但内容变了（精度不足）→ 强制完整读取
                         entry.can_dedup = False
                         self._file_states.record_read(fp, offset=offset, limit=limit)
             else:
                 # No previous state or marked as not dedupable - read full content
+                # 无历史状态或已标记不可去重 → 记录本次读取并强制完整读取
                 self._file_states.record_read(fp, offset=offset, limit=limit)
                 # Force full read by setting can_dedup to False for this read
                 if entry:
@@ -349,6 +386,8 @@ class ReadFileTool(_FsTool):
             # concern (git checkouts with autocrlf, editors saving CRLF) but
             # applied on all platforms so downstream StrReplace/Grep behavior
             # is consistent regardless of where the file was written.
+            # 将 CRLF 统一为 LF，主要针对 Windows（git autocrlf、编辑器保存 CRLF），
+            # 但在所有平台执行以保证后续编辑/搜索行为一致。
             text_content = text_content.replace("\r\n", "\n")
 
             all_lines = text_content.splitlines()
@@ -364,6 +403,7 @@ class ReadFileTool(_FsTool):
             numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(all_lines[start:end])]
             result = "\n".join(numbered)
 
+            # 超过最大字符数时逐行截断，保留完整的行
             if len(result) > self._MAX_CHARS:
                 trimmed, chars = [], 0
                 for line in numbered:
@@ -464,7 +504,10 @@ class ReadFileTool(_FsTool):
     )
 )
 class WriteFileTool(_FsTool):
-    """Write content to a file."""
+    """Write content to a file.
+
+    将内容写入文件，覆盖已有文件或创建新文件。会自动创建父目录。
+    """
     _scopes = {"core", "subagent", "memory"}
 
     @property
@@ -486,9 +529,11 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown path")
             if content is None:
                 raise ValueError("Unknown content")
+            # 写路径解析：受工作区边界约束，防止越权写入
             fp = self._resolve_write(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
+            # 记录写入状态，供后续 read 去重和 edit 的 read-before-edit 检查使用
             self._file_states.record_write(fp)
             return f"Successfully wrote {len(content)} characters to {fp}"
         except PermissionError as e:
@@ -542,7 +587,11 @@ def _curly_single_quotes(text: str) -> str:
 
 
 def _preserve_quote_style(old_text: str, actual_text: str, new_text: str) -> str:
-    """Preserve curly quote style when a quote-normalized fallback matched."""
+    """Preserve curly quote style when a quote-normalized fallback matched.
+
+    当通过引号归一化（弯引号->直引号）匹配成功时，保留原文件中实际的弯引号风格，
+    将 new_text 中的直引号转换为对应的弯引号。
+    """
     if _normalize_quotes(old_text.strip()) != _normalize_quotes(actual_text.strip()) or old_text == actual_text:
         return new_text
 
@@ -559,7 +608,11 @@ def _leading_ws(line: str) -> str:
 
 
 def _reindent_like_match(old_text: str, actual_text: str, new_text: str) -> str:
-    """Preserve the outer indentation from the actual matched block."""
+    """Preserve the outer indentation from the actual matched block.
+
+    当通过 trim 匹配（忽略行首缩进）成功时，将实际匹配块的外层缩进应用到 new_text，
+    保持替换后的代码缩进与原文件一致。
+    """
     old_lines = old_text.split("\n")
     actual_lines = actual_text.split("\n")
     if len(old_lines) != len(actual_lines):
@@ -603,6 +656,7 @@ class _MatchSpan:
 
 
 def _find_exact_matches(content: str, old_text: str) -> list[_MatchSpan]:
+    """精确子串匹配：在 content 中查找 old_text 的所有精确出现位置。"""
     matches: list[_MatchSpan] = []
     start = 0
     while True:
@@ -622,6 +676,11 @@ def _find_exact_matches(content: str, old_text: str) -> list[_MatchSpan]:
 
 
 def _find_trim_matches(content: str, old_text: str, *, normalize_quotes: bool = False) -> list[_MatchSpan]:
+    """逐行 strip 后的滑动窗口匹配：容忍缩进差异，可选容忍引号风格差异。
+
+    将 old_text 和 content 按行拆分，对每行 strip 后比较，找到所有匹配窗口。
+    用于处理用户提供的 old_text 缩进与文件实际缩进不一致的情况。
+    """
     old_lines = old_text.splitlines()
     if not old_lines:
         return []
@@ -670,6 +729,7 @@ def _find_trim_matches(content: str, old_text: str, *, normalize_quotes: bool = 
 
 
 def _find_quote_matches(content: str, old_text: str) -> list[_MatchSpan]:
+    """引号归一化匹配：将弯引号/直引号统一后做子串查找，容忍引号风格差异。"""
     norm_content = _normalize_quotes(content)
     norm_old = _normalize_quotes(old_text)
     matches: list[_MatchSpan] = []
@@ -691,7 +751,14 @@ def _find_quote_matches(content: str, old_text: str) -> list[_MatchSpan]:
 
 
 def _find_matches(content: str, old_text: str) -> list[_MatchSpan]:
-    """Locate all matches using progressively looser strategies."""
+    """Locate all matches using progressively looser strategies.
+
+    按从严到宽的顺序尝试多种匹配策略，返回第一个有结果的策略的匹配列表：
+    1. 精确子串匹配
+    2. 逐行 strip 的滑动窗口匹配（容忍缩进差异）
+    3. strip + 引号归一化匹配（容忍缩进和引号风格差异）
+    4. 纯引号归一化匹配（容忍引号风格差异）
+    """
     for matcher in (
         lambda: _find_exact_matches(content, old_text),
         lambda: _find_trim_matches(content, old_text),
@@ -725,7 +792,11 @@ def _diagnose_near_match(old_text: str, actual_text: str) -> list[str]:
 
 
 def _best_window(old_text: str, content: str) -> tuple[float, int, list[str], list[str]]:
-    """Find the closest line-window match and return ratio/start/snippet/hints."""
+    """Find the closest line-window match and return ratio/start/snippet/hints.
+
+    当精确匹配失败时，用 difflib 在 content 中滑动一个与 old_text 行数相同的窗口，
+    找到相似度最高的窗口，用于生成"最接近的匹配"诊断信息。
+    """
     lines = content.splitlines(keepends=True)
     old_lines = old_text.splitlines(keepends=True)
     window = max(1, len(old_lines))

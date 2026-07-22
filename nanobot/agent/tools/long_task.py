@@ -1,5 +1,9 @@
 """Sustained goal tools on the main agent (Codex-style).
 
+主 agent 上的持续目标（sustained goal）工具，采用 Codex 式长任务模式。
+核心思想：long_task 在会话元数据中注册一个持续目标，每轮将其镜像到 Runtime Context，
+确保上下文压缩不会丢失目标。目标完成后调用 complete_goal 结束跟踪。
+
 Follow the built-in **long-goal** skill for lifecycle rules and how to phrase
 objectives (especially **idempotent**, compaction-safe goals). Load that skill
 from the skills listing (path shown there) before composing ``long_task.goal`` text.
@@ -40,7 +44,12 @@ def _iso_now() -> str:
 
 
 class _GoalToolsMixin(ContextAware):
-    """Shared routing context + Session lookup."""
+    """Shared routing context + Session lookup.
+
+    目标工具共享混入：提供请求路由上下文（ContextVar）和会话查找能力，
+    以及目标状态变更的运行时事件发布。每个子类使用独立的 ContextVar，
+    避免不同工具类型（LongTaskTool 与 CompleteGoalTool）的并发任务互相干扰。
+    """
 
     def __init__(
         self,
@@ -70,7 +79,10 @@ class _GoalToolsMixin(ContextAware):
         return self._sessions.get_or_create(key)
 
     async def _publish_goal_state_changed(self, metadata: dict[str, Any]) -> None:
-        """Publish authoritative goal metadata as a runtime event."""
+        """Publish authoritative goal metadata as a runtime event.
+
+        将权威目标元数据作为运行时事件发布，供 WebUI 等订阅者实时感知目标状态变更。
+        """
         runtime_events = self._runtime_events
         rc = self._request_ctx.get()
         if runtime_events is None or rc is None:
@@ -109,7 +121,11 @@ class _GoalToolsMixin(ContextAware):
     )
 )
 class LongTaskTool(Tool, _GoalToolsMixin):
-    """Begin or replace focus on a long-running objective stored on the session."""
+    """Begin or replace focus on a long-running objective stored on the session.
+
+    注册或替换会话上的持续目标。若已有活跃目标则拒绝（需先 complete_goal）。
+    目标状态写入会话元数据并发布运行时事件，每轮镜像到 Runtime Context。
+    """
 
     def __init__(
         self,
@@ -153,6 +169,7 @@ class LongTaskTool(Tool, _GoalToolsMixin):
             return (
                 "Error: long_task requires an active chat session (missing routing context)."
             )
+        # 若已有活跃目标则拒绝，避免覆盖进行中的目标。
         prior = parse_goal_state(goal_state_raw(sess.metadata))
         if isinstance(prior, dict) and prior.get("status") == "active":
             return (
@@ -170,6 +187,7 @@ class LongTaskTool(Tool, _GoalToolsMixin):
         sess.metadata[GOAL_STATE_KEY] = blob
         discard_legacy_goal_state_key(sess.metadata)
         self._sessions.save(sess)
+        # 发布目标状态变更事件，通知 WebUI 等订阅者。
         await self._publish_goal_state_changed(sess.metadata)
         extra = f"\nSummary line: {summary}" if summary else ""
         return (
@@ -191,7 +209,11 @@ class LongTaskTool(Tool, _GoalToolsMixin):
     )
 )
 class CompleteGoalTool(Tool, _GoalToolsMixin):
-    """Mark the active sustained goal finished after all required work is verified."""
+    """Mark the active sustained goal finished after all required work is verified.
+
+    将活跃的持续目标标记为已完成。无论成功、取消、被替换都应调用，
+    recap 必须如实反映实际结果（不一定成功）。无活跃目标时安全返回。
+    """
 
     def __init__(
         self,
@@ -236,6 +258,7 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
             return "No active goal to complete."
 
         ended = _iso_now()
+        # 保留 prior 中的字段，更新状态为 completed 并记录结束时间与 recap。
         sess.metadata[GOAL_STATE_KEY] = {
             **prior,
             "status": "completed",

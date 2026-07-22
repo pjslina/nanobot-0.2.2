@@ -1,4 +1,11 @@
-"""Track file-read state for read-before-edit warnings and read deduplication."""
+"""Track file-read state for read-before-edit warnings and read deduplication.
+
+文件读取状态跟踪：记录 agent 读过哪些文件、读取时的 mtime 与内容哈希。
+用途有二：
+1. "读后改"警告：编辑前检查文件自上次读取后是否被外部改动，避免基于过期内容编辑；
+2. 读取去重：若文件自上次读取后未变，可跳过重复读取（"File unchanged since last read"）。
+状态按会话隔离（FileStateStore + contextvars），不会跨会话泄漏。
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ReadState:
+    # 单个文件的读取状态：mtime（修改时间）、offset/limit（读取范围）、content_hash（内容哈希）、can_dedup（是否可去重）。
     mtime: float
     offset: int
     limit: int | None
@@ -19,6 +27,7 @@ class ReadState:
 
 
 def _hash_file(p: str) -> str | None:
+    # 计算文件 SHA256 哈希；读取失败（如权限/不存在）返回 None。
     try:
         return hashlib.sha256(Path(p).read_bytes()).hexdigest()
     except OSError:
@@ -27,6 +36,10 @@ def _hash_file(p: str) -> str | None:
 
 class FileStates:
     """Per-session read/write tracker.
+
+    单会话的文件读写跟踪器。
+    拥有独立的状态字典，使"读取去重"和"读后改警告"都限定在单个 agent 会话内，
+    不会泄漏到同进程的其他会话。
 
     Owns its own state dict so read-dedup ("File unchanged since last read")
     and read-before-edit warnings stay scoped to one agent session and do
@@ -39,7 +52,7 @@ class FileStates:
         self._state: dict[str, ReadState] = {}
 
     def record_read(self, path: str | Path, offset: int = 1, limit: int | None = None) -> None:
-        """Record that a file was read (called after successful read)."""
+        """Record that a file was read (called after successful read). 记录一次成功的文件读取。"""
         p = str(Path(path).resolve())
         try:
             mtime = os.path.getmtime(p)
@@ -54,7 +67,7 @@ class FileStates:
         )
 
     def record_write(self, path: str | Path) -> None:
-        """Record that a file was written (updates mtime in state)."""
+        """Record that a file was written (updates mtime in state). 记录一次文件写入（更新 mtime）。"""
         p = str(Path(path).resolve())
         try:
             mtime = os.path.getmtime(p)
@@ -72,6 +85,11 @@ class FileStates:
     def check_read(self, path: str | Path) -> str | None:
         """Check if a file has been read and is fresh.
 
+        检查文件是否已被读取且仍"新鲜"（未被外部改动）。
+        返回 None 表示 OK，否则返回警告字符串。
+        当 mtime 变了但内容哈希相同（如 touch、编辑器原样保存）时，判定为未变，
+        避免误报"过期"警告。
+
         Returns None if OK, or a warning string.
         When mtime changed but file content is identical (e.g. touch, editor save),
         the check passes to avoid false-positive staleness warnings.
@@ -85,11 +103,12 @@ class FileStates:
         except OSError:
             return None
         if current_mtime != entry.mtime:
+            # mtime 变了：若内容哈希相同则视为未变（更新记录的 mtime），否则报"已被修改"。
             if entry.content_hash and _hash_file(p) == entry.content_hash:
                 entry.mtime = current_mtime
                 return None
             return "Warning: file has been modified since last read. Re-read to verify content before editing."
-        # mtime unchanged - still check content hash to detect quick modifications
+        # mtime 没变：仍用内容哈希兜底，检测"同 mtime 但内容已变"的快速修改。
         if entry.content_hash and _hash_file(p) != entry.content_hash:
             return "Warning: file has been modified since last read. Re-read to verify content before editing."
         return None
@@ -131,7 +150,10 @@ class FileStates:
 
 
 class FileStateStore:
-    """Lookup table for per-session file read/write state."""
+    """Lookup table for per-session file read/write state.
+
+    按会话 key 查找的文件读写状态表：每个会话拥有独立的 FileStates。
+    """
 
     __slots__ = ("_states_by_key",)
 
@@ -139,6 +161,7 @@ class FileStateStore:
         self._states_by_key: dict[str, FileStates] = {}
 
     def for_session(self, session_key: str | None) -> FileStates:
+        # 取（或创建）某会话的 FileStates；无 session_key 时用默认桶。
         key = session_key or "__default__"
         states = self._states_by_key.get(key)
         if states is None:
@@ -150,6 +173,7 @@ class FileStateStore:
         self._states_by_key.clear()
 
 
+# 当前异步任务绑定的 FileStates（按 asyncio 任务隔离），工具执行时通过它取当前会话状态。
 _current_file_states: ContextVar[FileStates | None] = ContextVar(
     "nanobot_file_states",
     default=None,
@@ -157,12 +181,12 @@ _current_file_states: ContextVar[FileStates | None] = ContextVar(
 
 
 def current_file_states(default: FileStates) -> FileStates:
-    """Return the FileStates bound to the current agent task, or a fallback."""
+    """Return the FileStates bound to the current agent task, or a fallback. 返回当前任务绑定的文件状态，无则用 fallback。"""
     return _current_file_states.get() or default
 
 
 def bind_file_states(file_states: FileStates) -> Token[FileStates | None]:
-    """Bind file read/write state for the current async task."""
+    """Bind file read/write state for the current async task. 为当前异步任务绑定文件读写状态。"""
     return _current_file_states.set(file_states)
 
 

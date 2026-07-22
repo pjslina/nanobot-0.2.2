@@ -1,4 +1,11 @@
-"""Coordination for scheduled cron turns."""
+"""Coordination for scheduled cron turns.
+
+定时 cron turn 的协调器。cron 任务触发的 turn 与普通用户消息不同：
+它需要一个"提交-等待响应"的同步语义（submit 返回该 turn 的响应），
+同时不能与正在进行的实时用户 turn 混在一起（避免抢占或重复注入）。
+本协调器管理这些：用 future 让 submit 等待对应 turn 的响应；
+当目标会话正忙时把 cron turn 延迟到会话空闲后再投递。
+"""
 
 from __future__ import annotations
 
@@ -15,7 +22,10 @@ from nanobot.cron.session_turns import (
 
 
 class CronTurnCoordinator:
-    """Manage scheduled cron turns without mixing them into live injections."""
+    """Manage scheduled cron turns without mixing them into live injections.
+
+    管理定时 cron turn，避免与实时用户注入混淆。
+    """
 
     def __init__(
         self,
@@ -27,12 +37,17 @@ class CronTurnCoordinator:
         self._publish_inbound = publish_inbound
         self._dispatch = dispatch
         self._is_running = is_running
-        self.deferred_queues: dict[str, list[InboundMessage]] = {}
-        self._waiters: dict[str, asyncio.Future[OutboundMessage | None]] = {}
-        self._pending_messages_by_run_id: dict[str, InboundMessage] = {}
+        self.deferred_queues: dict[str, list[InboundMessage]] = {}  # 会话 key -> 延迟待投递的 cron 消息
+        self._waiters: dict[str, asyncio.Future[OutboundMessage | None]] = {}  # run_id -> 等待响应的 future
+        self._pending_messages_by_run_id: dict[str, InboundMessage] = {}  # run_id -> 正在处理的 cron 消息
 
     async def submit(self, msg: InboundMessage) -> OutboundMessage | None:
-        """Submit a scheduled cron turn and wait for its session response."""
+        """Submit a scheduled cron turn and wait for its session response.
+
+        提交一个定时 cron turn 并等待其会话响应。
+        agent 主循环运行中则走 publish_inbound（正常入队），否则直接 dispatch。
+        用 future 阻塞等待 complete() 把响应回填。
+        """
         run_id = cron_run_id(msg.metadata)
         if not run_id:
             raise ValueError("cron turn metadata must include a run_id")
@@ -95,6 +110,7 @@ class CronTurnCoordinator:
         response: OutboundMessage | None = None,
         error: BaseException | None = None,
     ) -> None:
+        # 把某个 cron turn 的响应/异常回填给等待它的 submit()（通过 run_id 关联 future）。
         run_id = cron_run_id(msg.metadata)
         if not run_id:
             return
