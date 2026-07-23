@@ -1,4 +1,10 @@
-"""Channel manager for coordinating chat channels."""
+"""Channel manager for coordinating chat channels.
+
+渠道管理器：负责发现并初始化已启用的渠道、统一启停，并把出站消息
+（OutboundMessage）按渠道名分发到对应实例。所有出站消息的投递、
+重试退避、流式分块合并与重复内容抑制均在此集中处理，是渠道子系统的
+中枢协调者。
+"""
 
 from __future__ import annotations
 
@@ -48,6 +54,11 @@ class ChannelManager:
     - Initialize enabled channels (Telegram, WhatsApp, etc.)
     - Start/stop channels
     - Route outbound messages
+
+    职责：
+    - 通过 pkgutil 扫描 + 入口点插件发现渠道，仅初始化配置中 enabled=True 的渠道；
+    - 统一启动/停止所有渠道及出站消息分发协程；
+    - 将出站消息按 ``msg.channel`` 路由到对应渠道，并负责重试、流式合并与去重。
     """
 
     def __init__(
@@ -79,13 +90,21 @@ class ChannelManager:
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+        """Initialize channels discovered via pkgutil scan + entry_points plugins.
+
+        通过 pkgutil 扫描与 entry_points 插件发现渠道并完成初始化。先收集所有
+        ``enabled=True`` 的模块名，再仅导入这些模块，从而避免加载未启用渠道所
+        依赖的第三方 SDK（如 telegram、discord.py 等），加快启动速度。
+        """
         from nanobot.channels.registry import discover_channel_names, discover_enabled
 
         # Collect enabled module names first, then only import those.
         # Channel configs live in ChannelsConfig's extra fields (via
         # extra="allow"), so we enumerate candidates from pkgutil scan
         # (cheap, no imports) and any plugin keys in __pydantic_extra__.
+        # 渠道配置存放在 ChannelsConfig 的 extra 字段中（extra="allow"），
+        # 因此先通过 pkgutil 扫描（零导入、开销小）与 __pydantic_extra__
+        # 中的插件键枚举候选名，再判断哪些是 enabled。
         names = discover_channel_names()
         candidate_names = set(names)
         extra = getattr(self.config.channels, "__pydantic_extra__", None) or {}
@@ -109,6 +128,8 @@ class ChannelManager:
                 continue
             try:
                 kwargs: dict[str, Any] = {}
+                # websocket 渠道需要额外构建 gateway 服务（承载 WebUI 的
+                # WebSocket 多路复用、会话/工具/静态资源等），因此在此特判注入。
                 if cls.name == "websocket":
                     from nanobot.channels.websocket import WebSocketConfig
                     from nanobot.webui.gateway_services import build_gateway_services
@@ -150,6 +171,7 @@ class ChannelManager:
         self._validate_allow_from()
 
     def _validate_allow_from(self) -> None:
+        """校验各渠道的 allow_from 配置；未配置时提示进入“仅配对”模式。"""
         for name, ch in self.channels.items():
             cfg = ch.config
             if isinstance(cfg, dict):
@@ -162,13 +184,19 @@ class ChannelManager:
             if allow is None:
                 # allowFrom omitted → pairing-only mode.  Unapproved senders
                 # receive a pairing code instead of being silently ignored.
+                # 未配置 allow_from -> 进入“仅配对”模式：未批准的发送者会收到
+                # 一个配对码，而不是被静默忽略（见 base._handle_message）。
                 logger.info(
                     '"{}" has no allowFrom; unapproved users will receive a pairing code',
                     name,
                 )
 
     def _should_send_progress(self, channel_name: str, *, tool_hint: bool = False) -> bool:
-        """Return whether progress (or tool-hints) may be sent to *channel_name*."""
+        """Return whether progress (or tool-hints) may be sent to *channel_name*.
+
+        返回是否允许向该渠道发送进度（或工具提示）消息，依据渠道实例上
+        的 ``send_progress`` / ``send_tool_hints`` 开关。
+        """
         ch = self.channels.get(channel_name)
         if ch is None:
             logger.debug("Progress check for unknown channel: {}", channel_name)
@@ -193,14 +221,21 @@ class ChannelManager:
         return value if isinstance(value, bool) else default
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
-        """Start a channel and log any exceptions."""
+        """Start a channel and log any exceptions.
+
+        启动单个渠道并捕获异常，避免某个渠道启动失败导致整个管理器崩溃。
+        """
         try:
             await channel.start()
         except Exception:
             logger.exception("Failed to start channel {}", name)
 
     async def start_all(self) -> None:
-        """Start all channels and the outbound dispatcher."""
+        """Start all channels and the outbound dispatcher.
+
+        启动所有渠道及出站消息分发协程。各渠道的 start() 通常为永久运行的
+        异步任务，故用 gather 等待它们整体运行；分发协程单独创建。
+        """
         if not self.channels:
             logger.warning("No channels enabled")
             return
@@ -220,7 +255,11 @@ class ChannelManager:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def _notify_restart_done_if_needed(self) -> None:
-        """Send restart completion message when runtime env markers are present."""
+        """Send restart completion message when runtime env markers are present.
+
+        当运行时环境带有“重启通知”标记时（自更新/重启后），向触发重启的
+        目标渠道与会话发送一条“重启完成”消息。无标记则直接返回。
+        """
         notice = consume_restart_notice_from_env()
         if not notice:
             return
@@ -238,7 +277,11 @@ class ChannelManager:
         ))
 
     async def stop_all(self) -> None:
-        """Stop all channels and the dispatcher."""
+        """Stop all channels and the dispatcher.
+
+        先取消出站分发协程，再逐个停止各渠道并清理资源；单个渠道停止异常
+        不影响其他渠道。注意区分“被外部取消”与“真实异常”以支持优雅关闭。
+        """
         logger.info("Stopping all channels...")
 
         # Stop dispatcher
@@ -261,17 +304,29 @@ class ChannelManager:
 
     @staticmethod
     def _fingerprint_content(content: str) -> str:
+        """计算内容的“指纹”：先按任意空白拆分再用单个空格拼接（归一化空白），
+        再取 SHA1；空内容返回空串。用于出站消息去重，避免仅空白差异的重复回复。"""
+        # split() 无参时按任意长度空白拆分并丢弃首尾空白，等价于折叠所有空白
         normalized = " ".join(content.split())
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
     def _should_suppress_outbound(self, msg: OutboundMessage) -> bool:
+        """判断是否应抑制（丢弃）该出站消息以避免重复回复。
+
+        去重策略：以 (渠道, 会话, 来源消息id) 为键记录已发送内容的指纹，
+        若同一来源消息已收到过完全相同（空白归一化后）的回复，则抑制本次。
+        进度消息（_progress）始终放行；空内容无法去重。
+        """
         metadata = msg.metadata or {}
+        # 进度类消息是瞬时的，不参与去重
         if metadata.get("_progress"):
             return False
         fingerprint = self._fingerprint_content(msg.content)
         if not fingerprint:
             return False
 
+        # origin_message_id：本条回复所对应的入站消息。若此前已向同一来源
+        # 发送过相同指纹的回复，视为重复 -> 抑制；否则记下本次指纹。
         origin_message_id = metadata.get("origin_message_id")
         if isinstance(origin_message_id, str) and origin_message_id:
             key = (msg.channel, msg.chat_id, origin_message_id)
@@ -279,6 +334,8 @@ class ChannelManager:
                 return True
             self._origin_reply_fingerprints[key] = fingerprint
 
+        # message_id：本条出站消息自身的 id。仅登记指纹（不抑制），
+        # 以便后续以本消息为来源的回复可据此去重。
         message_id = metadata.get("message_id")
         if isinstance(message_id, str) and message_id:
             key = (msg.channel, msg.chat_id, message_id)
@@ -287,11 +344,19 @@ class ChannelManager:
         return False
 
     async def _dispatch_outbound(self) -> None:
-        """Dispatch outbound messages to the appropriate channel."""
+        """Dispatch outbound messages to the appropriate channel.
+
+        出站消息分发主循环：不断从消息总线取出 OutboundMessage，依据 metadata
+        中的标记（reasoning / progress / stream_delta 等）分类处理，再路由到
+        目标渠道；同时负责流式分块合并、重复抑制与失败重试。收到 CancelledError
+        时退出循环以支持优雅关闭。
+        """
         logger.info("Outbound dispatcher started")
 
         # Buffer for messages that couldn't be processed during delta coalescing
         # (since asyncio.Queue doesn't support push_front)
+        # 暂存“合并流式分块时被取出但不属于当前流”的消息：asyncio.Queue 不支持
+        # push_front（塞回队首），故用此列表暂存，下一轮优先消费。
         pending: list[OutboundMessage] = []
 
         while True:
@@ -317,11 +382,14 @@ class ChannelManager:
                     # content silently drops here. ``_reasoning`` (one-shot)
                     # is accepted for backward compatibility with hooks that
                     # haven't migrated to delta/end yet.
+                    # 推理/思考内容走独立通道：仅当目标渠道开启 show_reasoning 且
+                    # 重写了流式原语时才投递；否则基类为 no-op，内容在此静默丢弃。
                     channel = self.channels.get(msg.channel)
                     if channel is not None and channel.show_reasoning:
                         await self._send_with_retry(channel, msg)
                     continue
 
+                # 进度类消息：按“工具提示 / 普通进度”分别检查渠道开关，未开启则跳过
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self._should_send_progress(
                         msg.channel, tool_hint=True,
@@ -332,9 +400,11 @@ class ChannelManager:
                     ):
                         continue
 
+                # _retry_wait：仅用于在前端展示“重试等待中”的提示，无需投递到渠道
                 if msg.metadata.get("_retry_wait"):
                     continue
 
+                # 运行时模型切换通知：仅 websocket 渠道关心；若 websocket 未启用则跳过
                 if (
                     msg.metadata.get("_runtime_model_updated")
                     and msg.channel == "websocket"
@@ -344,6 +414,7 @@ class ChannelManager:
 
                 # Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
                 # to reduce API calls and improve streaming latency
+                # 合并同一 (渠道, 会话) 连续的流式分块，减少 API 调用、降低流式延迟
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):
                     msg, extra_pending = self._coalesce_stream_deltas(msg)
                     pending.extend(extra_pending)
@@ -352,6 +423,8 @@ class ChannelManager:
                 if channel:
                     # Duplicate suppression is scoped to a known source message
                     # so repeated content from separate turns is still delivered.
+                    # 重复抑制仅针对“已知来源消息”的非流式最终消息，因此不同轮次中
+                    # 出现的相同内容仍会正常投递（不会被误判为重复）。
                     if (
                         not msg.metadata.get("_stream_delta")
                         and not msg.metadata.get("_stream_end")
@@ -365,13 +438,20 @@ class ChannelManager:
                     logger.warning("Unknown channel: {}", msg.channel)
 
             except asyncio.TimeoutError:
+                # 取消息超时（1s 内无出站消息）-> 继续下一轮，保持循环存活
                 continue
             except asyncio.CancelledError:
+                # 被取消（优雅关闭）-> 退出分发循环
                 break
 
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
-        """Send one outbound message without retry policy."""
+        """Send one outbound message without retry policy.
+
+        按 metadata 标记把消息派发到渠道对应的原语：推理结束/分块、一次性推理、
+        文件编辑事件、流式分块/结束，以及普通完整消息（已被 _streamed 标记的不再发送）。
+        本方法不含重试逻辑，统一由 _send_with_retry 包裹调用。
+        """
         if msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
         elif msg.metadata.get("_reasoning_delta"):
@@ -401,8 +481,14 @@ class ChannelManager:
         This reduces the number of API calls when the queue has accumulated multiple
         deltas, which happens when LLM generates faster than the channel can process.
 
+        合并同一 (渠道, 会话) 中连续的 _stream_delta 消息：当 LLM 生成速度
+        快于渠道处理速度时，队列会堆积多个分块，合并后一次发送可减少 API 调用
+        并降低流式延迟。仅合并连续分块，遇到任何其它消息即停止，并把该边界消息
+        交回分发循环经 pending 暂存。
+
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
+            返回 (合并后的消息, 不属于本流、需原样交回的消息列表)
         """
         target_key = (first_msg.channel, first_msg.chat_id)
         combined_content = first_msg.content
@@ -411,27 +497,33 @@ class ChannelManager:
 
         # Only merge consecutive deltas. As soon as we hit any other message,
         # stop and hand that boundary back to the dispatcher via `pending`.
+        # 仅合并连续分块；一旦遇到不属于本流的消息，立即停止并把它交回分发循环。
         while True:
             try:
+                # 非阻塞地取出下一条消息，队列空则结束合并
                 next_msg = self.bus.outbound.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
             # Check if this message belongs to the same stream
+            # 判断该消息是否属于同一条流（同渠道同会话且为 delta 分块）
             same_target = (next_msg.channel, next_msg.chat_id) == target_key
             is_delta = next_msg.metadata and next_msg.metadata.get("_stream_delta")
             is_end = next_msg.metadata and next_msg.metadata.get("_stream_end")
 
             if same_target and is_delta and not final_metadata.get("_stream_end"):
                 # Accumulate content
+                # 累加文本内容
                 combined_content += next_msg.content
                 # If we see _stream_end, remember it and stop coalescing this stream
+                # 遇到流结束标记则记下并停止本流合并
                 if is_end:
                     final_metadata["_stream_end"] = True
                     # Stream ended - stop coalescing this stream
                     break
             else:
                 # First non-matching message defines the coalescing boundary.
+                # 首条不匹配的消息即合并边界，交回 pending 由后续轮次处理
                 non_matching.append(next_msg)
                 break
 
@@ -447,6 +539,9 @@ class ChannelManager:
         """Send a message with retry on failure using exponential backoff.
 
         Note: CancelledError is re-raised to allow graceful shutdown.
+
+        失败时按指数退避（1s/2s/4s）重试，最多 send_max_retries 次；耗尽后记录
+        异常并放弃。CancelledError 始终向上抛出，以保证优雅关闭不被重试逻辑吞掉。
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
 

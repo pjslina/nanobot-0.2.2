@@ -1,4 +1,9 @@
-"""Email channel implementation using IMAP polling + SMTP replies."""
+"""Email channel implementation using IMAP polling + SMTP replies.
+
+邮件渠道：入站采用 IMAP 轮询（按固定间隔拉取未读邮件并解析），出站通过
+SMTP 回复发送方。该渠道为"拉取式"而非实时推送，频率受 ``poll_interval_seconds``
+控制；同时支持 SPF/DKIM 反伪造校验、附件提取、以及处理后的删除/移动等后续动作。
+"""
 
 import asyncio
 import html
@@ -31,7 +36,13 @@ from nanobot.utils.helpers import safe_filename
 
 
 class EmailConfig(Base):
-    """Email channel configuration (IMAP inbound + SMTP outbound)."""
+    """Email channel configuration (IMAP inbound + SMTP outbound).
+
+    邮件渠道配置：包含 IMAP 入站（主机/端口/邮箱/SSL）、SMTP 出站（主机/端口/
+    TLS/SSL/发件地址）、轮询与回复策略、反伪造校验（DKIM/SPF）开关、以及附件
+    类型与大小限制等。``consent_granted`` 必须显式置为 True 才会真正启动渠道，
+    以避免在用户未授权时自动读取/发送邮件。
+    """
 
     enabled: bool = False
     consent_granted: bool = False
@@ -63,6 +74,7 @@ class EmailConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
 
     # Email authentication verification (anti-spoofing)
+    # 邮件反伪造校验：要求入站邮件 Authentication-Results 头含对应 pass
     verify_dkim: bool = True   # Require Authentication-Results with dkim=pass
     verify_spf: bool = True    # Require Authentication-Results with spf=pass
 
@@ -74,6 +86,13 @@ class EmailConfig(Base):
 
 @dataclass
 class _ServerFeatures:
+    """IMAP 服务器能力探测结果，在一次会话内缓存以避免重复探测。
+
+    ``move``/``uidplus`` 来自 CAPABILITY 响应；``uid_store`` 在运行时学习
+    （None=未测试 / True=支持 / False=不支持 UID STORE），用于在后续 UID 上
+    跳过已知不可用的路径。
+    """
+
     move: bool
     uidplus: bool
     uid_store: bool | None = None
@@ -89,6 +108,11 @@ class EmailChannel(BaseChannel):
 
     Outbound:
     - Send responses via SMTP back to the sender address.
+
+    中文说明：邮件渠道以"轮询"方式工作。入站侧定期连接 IMAP 拉取未读邮件，
+    逐一解析发件人、主题、正文与附件，并做发件人归属判断、SPF/DKIM 反伪造
+    校验与权限校验，通过后封装为 InboundMessage 发布到总线。出站侧通过 SMTP
+    将回复发送给原发件人，并在邮件头中带上 In-Reply-To/References 以维持线程。
     """
 
     name = "email"
@@ -139,7 +163,12 @@ class EmailChannel(BaseChannel):
         self._MAX_PROCESSED_UIDS = 100000
 
     async def start(self) -> None:
-        """Start polling IMAP for inbound emails."""
+        """Start polling IMAP for inbound emails.
+
+        启动 IMAP 轮询主循环：每隔 ``poll_interval_seconds``（下限 5 秒）拉取一次
+        未读邮件，解析并投递到消息总线，再对已处理邮件执行配置的后续动作（删除/移动）。
+        单轮异常被捕获并记录，不中断循环；收到停止信号后退出。
+        """
         if not self.config.consent_granted:
             self.logger.warning(
                 "Email channel disabled: consent_granted is false. "
@@ -162,6 +191,7 @@ class EmailChannel(BaseChannel):
         poll_seconds = max(5, int(self.config.poll_interval_seconds))
         while self._running:
             try:
+                # IMAP 为阻塞式同步调用，放到线程池执行以免阻塞事件循环
                 inbound_items, skipped_uids = await asyncio.to_thread(self._fetch_new_messages)
                 should_apply_post_action = self._should_apply_post_action()
                 post_actions_uids: set[str] = set()
@@ -191,6 +221,8 @@ class EmailChannel(BaseChannel):
                     if uid and should_apply_post_action:
                         post_actions_uids.add(uid)
 
+                # post_action_ignore_skipped=False 时，连被跳过（未授权/反伪造失败）
+                # 的邮件也纳入后续动作，避免它们一直以 UNSEEN 状态被反复拉取
                 if should_apply_post_action and not self.config.post_action_ignore_skipped:
                     post_actions_uids.update(skipped_uids)
 
@@ -202,11 +234,21 @@ class EmailChannel(BaseChannel):
             await asyncio.sleep(poll_seconds)
 
     async def stop(self) -> None:
-        """Stop polling loop."""
+        """Stop polling loop.
+
+        停止轮询：仅置位 ``_running=False``，当前 ``sleep`` 结束后主循环自然退出。
+        IMAP/SMTP 连接按需创建、用完即关，故无需在此显式关闭长连接。
+        """
         self._running = False
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send email via SMTP."""
+        """Send email via SMTP.
+
+        通过 SMTP 发送一封回复邮件：依据 ``chat_id``（即收件人地址）是否曾收到过
+        其来信判断是否为"回复"；构造主题（带 Re: 前缀）、追加失败附件的占位文本、
+        设置 In-Reply-To/References 头以维持邮件线程，最后经线程池执行 SMTP 投递。
+        进度类消息（``_progress``）会被跳过，避免每次工具调用后发出空邮件。
+        """
         if not self.config.consent_granted:
             self.logger.warning("Skip email send: consent_granted is false")
             return
@@ -226,6 +268,7 @@ class EmailChannel(BaseChannel):
             return
 
         # Determine if this is a reply (recipient has sent us an email before)
+        # 用"是否曾收到过该地址的来信"判断是否为回复：仅回复场景受 auto_reply_enabled 约束
         is_reply = to_addr in self._last_subject_by_chat
         force_send = bool((msg.metadata or {}).get("force_send"))
 
@@ -299,6 +342,7 @@ class EmailChannel(BaseChannel):
 
         in_reply_to = self._last_message_id_by_chat.get(to_addr)
         if in_reply_to:
+            # 设置 In-Reply-To / References 头，使回复挂接到原邮件线程
             email_msg["In-Reply-To"] = in_reply_to
             email_msg["References"] = in_reply_to
 
@@ -332,6 +376,7 @@ class EmailChannel(BaseChannel):
         return True
 
     def _smtp_send(self, msg: EmailMessage) -> None:
+        """通过 SMTP 发送邮件，按配置选择 SSL 直连或 STARTTLS 升级。"""
         timeout = 30
         if self.config.smtp_use_ssl:
             with smtplib.SMTP_SSL(
@@ -350,7 +395,11 @@ class EmailChannel(BaseChannel):
             smtp.send_message(msg)
 
     def _fetch_new_messages(self) -> tuple[list[dict[str, Any]], set[str]]:
-        """Poll IMAP and return parsed unread messages plus skipped message UIDs."""
+        """Poll IMAP and return parsed unread messages plus skipped message UIDs.
+
+        轮询 IMAP 拉取未读（UNSEEN）邮件：返回已解析的入站消息列表，以及被跳过
+        （自发件、反伪造失败、未授权等）的邮件 UID 集合，供后续动作判断使用。
+        """
         return self._fetch_messages(
             search_criteria=("UNSEEN",),
             mark_seen=self.config.mark_seen,
@@ -368,6 +417,9 @@ class EmailChannel(BaseChannel):
         Fetch messages in [start_date, end_date) by IMAP date search.
 
         This is used for historical summarization tasks (e.g. "yesterday").
+
+        按日期区间拉取邮件（SINCE/BEFORE），用于历史摘要类任务（如"昨天的邮件"）。
+        不标记已读、不去重，仅返回限定数量的消息。
         """
         if end_date <= start_date:
             return []
@@ -392,6 +444,11 @@ class EmailChannel(BaseChannel):
         dedupe: bool,
         limit: int,
     ) -> tuple[list[dict[str, Any]], set[str]]:
+        """按给定 IMAP 搜索条件拉取邮件，并在连接失效时自动重试一次。
+
+        IMAP 长连接易因空闲超时被服务端断开，故捕获到"stale"类错误时重连重试
+        一次；其它异常直接抛出。
+        """
         messages: list[dict[str, Any]] = []
         skipped_uids: set[str] = set()
         cycle_uids: set[str] = set()
@@ -425,7 +482,13 @@ class EmailChannel(BaseChannel):
         skipped_uids: set[str],
         cycle_uids: set[str],
     ) -> None:
-        """Fetch messages by arbitrary IMAP search criteria."""
+        """Fetch messages by arbitrary IMAP search criteria.
+
+        单次 IMAP 拉取的核心实现：打开邮箱、搜索匹配邮件、逐封抓取并解析。每封
+        邮件依次经过：UID 去重 -> 发件人归属判断（忽略自发件）-> SPF/DKIM 反伪造
+        校验 -> 权限校验 -> 正文/附件提取 -> 标记已读。被任一环节跳过的邮件记入
+        ``skipped_uids`` 并登记 UID 以免重复处理。
+        """
         mailbox = self.config.imap_mailbox or "INBOX"
 
         client = self._open_imap_client(mailbox=mailbox, missing_mailbox_ok=True)
@@ -439,8 +502,10 @@ class EmailChannel(BaseChannel):
 
             ids = data[0].split()
             if limit > 0 and len(ids) > limit:
+                # 仅取最近 limit 封（序列号按时间递增，取尾部即最新）
                 ids = ids[-limit:]
             for imap_id in ids:
+                # BODY.PEEK[] 读取正文但不自动标记已读，UID 一并取回用于去重
                 status, fetched = client.fetch(imap_id, "(BODY.PEEK[] UID)")
                 if status != "OK" or not fetched:
                     continue
@@ -469,6 +534,7 @@ class EmailChannel(BaseChannel):
                     continue
 
                 # --- Anti-spoofing: verify Authentication-Results ---
+                # 反伪造校验：解析 Authentication-Results 头中的 SPF/DKIM 结论
                 spf_pass, dkim_pass = self._check_authentication_results(parsed)
                 if self.config.verify_spf and not spf_pass:
                     self.logger.warning(
@@ -508,6 +574,7 @@ class EmailChannel(BaseChannel):
                     body = "(empty email body)"
 
                 body = body[: self.config.max_body_chars]
+                # 拼装带 [EMAIL-CONTEXT] 前缀的上下文，让 LLM 明确这是一封邮件及其元信息
                 content = (
                     f"[EMAIL-CONTEXT] Email received.\n"
                     f"From: {sender}\n"
@@ -556,6 +623,11 @@ class EmailChannel(BaseChannel):
             self._close_imap_client(client)
 
     def _open_imap_client(self, mailbox: str, *, missing_mailbox_ok: bool = False) -> Any | None:
+        """建立 IMAP 连接并选中邮箱；可选地容忍邮箱不存在。
+
+        ``missing_mailbox_ok=True`` 时，若目标邮箱不存在则返回 None 而非抛出，
+        便于轮询在邮箱暂时不可用时跳过本轮而非崩溃。
+        """
         if self.config.imap_use_ssl:
             client: Any = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
         else:
@@ -588,7 +660,11 @@ class EmailChannel(BaseChannel):
             client.logout()
 
     def _collect_self_addresses(self) -> set[str]:
-        """Return normalized email addresses owned by this channel instance."""
+        """Return normalized email addresses owned by this channel instance.
+
+        收集本渠道自身拥有的邮箱地址（来自 from_address、smtp_username、imap_username），
+        归一化后用于识别"自发件"邮件并忽略，避免机器人回复自己造成循环。
+        """
         candidates = (
             self.config.from_address,
             self.config.smtp_username,
@@ -603,7 +679,10 @@ class EmailChannel(BaseChannel):
 
     @staticmethod
     def _normalize_address(value: str) -> str:
-        """Normalize an address or mailbox-like identifier for comparisons."""
+        """Normalize an address or mailbox-like identifier for comparisons.
+
+        归一化邮箱地址：去掉首尾空白、解析出真实邮箱部分并转小写，用于发件人比较。
+        """
         raw = (value or "").strip()
         if not raw:
             return ""
@@ -620,7 +699,12 @@ class EmailChannel(BaseChannel):
         return bool(normalized_sender) and normalized_sender in self._self_addresses
 
     def _remember_processed_uid(self, uid: str, dedupe: bool, cycle_uids: set[str]) -> None:
-        """Track a fetched UID so skipped messages are not reprocessed forever."""
+        """Track a fetched UID so skipped messages are not reprocessed forever.
+
+        登记 UID 防止被跳过的邮件被反复处理：``cycle_uids`` 记录本轮已处理 UID，
+        ``_processed_uids`` 在去重开启时跨轮持久记忆。后者有上限，超限时淘汰一半
+        （mark_seen 是主要去重手段，此集合仅为安全网）。
+        """
         if not uid:
             return
         cycle_uids.add(uid)
@@ -635,6 +719,7 @@ class EmailChannel(BaseChannel):
         return self.config.post_action in {"delete", "move"}
 
     def _apply_post_actions_batch(self, post_actions_uids: list[str]) -> None:
+        """在单个 IMAP 会话内批量执行后续动作（删除/移动），减少连接开销。"""
         if not self._should_apply_post_action() or not post_actions_uids:
             return
 
@@ -660,6 +745,11 @@ class EmailChannel(BaseChannel):
         uid: str,
         features: _ServerFeatures,
     ) -> None:
+        """对单封邮件执行配置的后续动作：删除或移动到指定邮箱。
+
+        移动优先使用 UID MOVE；不支持时退化为 COPY + 标记删除 + 清理。删除则
+        标记 ``\\Deleted`` 后按能力选择 UID EXPUNGE 或全量 EXPUNGE。
+        """
         action = self.config.post_action
 
         if action == "delete":
@@ -686,6 +776,7 @@ class EmailChannel(BaseChannel):
 
     @staticmethod
     def _server_features(client: Any) -> _ServerFeatures:
+        """探测 IMAP 服务器能力（MOVE / UIDPLUS），用于选择后续动作的实现路径。"""
         caps: set[str] = set()
         with suppress(Exception):
             status, data = client.capability()
@@ -703,6 +794,8 @@ class EmailChannel(BaseChannel):
         # (session-local). We target by UID first, but some servers may reject
         # UID STORE. In that case we resolve the current sequence number for the
         # UID and retry with STORE using that sequence id.
+        # IMAP 有两种消息标识：UID（稳定）与序列号（仅当前会话有效）。优先用 UID，
+        # 若服务器拒绝 UID STORE 则回退为按序列号操作。
         status, data = client.search(None, "UID", uid)
         if status != "OK" or not data or not data[0]:
             return None
@@ -712,6 +805,8 @@ class EmailChannel(BaseChannel):
         # Optimistic path: try UID STORE first because UID is stable and avoids
         # sequence-number lookup. If this fails once for the session, remember it
         # and use the sequence STORE fallback directly for remaining UIDs.
+        # 乐观路径：优先 UID STORE（UID 稳定、免查序列号）。本会话内若失败一次，
+        # 则记下并在后续 UID 上直接走序列号 STORE 回退，避免重复试探。
         if features.uid_store is not False:
             status, _ = client.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
             if status == "OK":
@@ -721,6 +816,7 @@ class EmailChannel(BaseChannel):
 
         # Compatibility fallback for servers where UID STORE is unavailable or
         # unreliable: resolve the current sequence number from UID and use STORE.
+        # 兼容回退：对不支持/不可靠的 UID STORE，按 UID 解析出当前序列号再 STORE
         imap_id = self._lookup_imap_id_by_uid(client, uid)
         if not imap_id:
             self.logger.warning("Post-action skipped: UID {} not found", uid)
@@ -735,6 +831,7 @@ class EmailChannel(BaseChannel):
     def _uid_expunge_or_fallback(self, client: Any, uid: str, features: _ServerFeatures) -> None:
         # Prefer UID-scoped expunge when supported to avoid expunging unrelated
         # messages already marked \Deleted in the selected mailbox.
+        # 优先用 UID 范围 EXPUNGE，避免误删当前邮箱中其它已标记 \\Deleted 的无关邮件
         if features.uidplus:
             status, _ = client.uid("EXPUNGE", uid)
             if status == "OK":
@@ -745,17 +842,23 @@ class EmailChannel(BaseChannel):
 
     @classmethod
     def _is_stale_imap_error(cls, exc: Exception) -> bool:
+        """判断异常是否为 IMAP 连接失效（空闲断开/连接重置等），用于触发重连重试。"""
         message = str(exc).lower()
         return any(marker in message for marker in cls._IMAP_RECONNECT_MARKERS)
 
     @classmethod
     def _is_missing_mailbox_error(cls, exc: Exception) -> bool:
+        """判断异常是否为"邮箱不存在"，用于在 missing_mailbox_ok 时跳过而非崩溃。"""
         message = str(exc).lower()
         return any(marker in message for marker in cls._IMAP_MISSING_MAILBOX_MARKERS)
 
     @classmethod
     def _format_imap_date(cls, value: date) -> str:
-        """Format date for IMAP search (always English month abbreviations)."""
+        """Format date for IMAP search (always English month abbreviations).
+
+        格式化 IMAP 日期搜索字符串（DD-Mon-YYYY）。强制使用英文月份缩写，避免
+        本机 locale 为非英文时导致 IMAP SEARCH 解析失败。
+        """
         month = cls._IMAP_MONTHS[value.month - 1]
         return f"{value.day:02d}-{month}-{value.year}"
 
@@ -787,7 +890,12 @@ class EmailChannel(BaseChannel):
 
     @classmethod
     def _extract_text_body(cls, msg: Any) -> str:
-        """Best-effort extraction of readable body text."""
+        """Best-effort extraction of readable body text.
+
+        尽力提取可读正文：多部分邮件优先收集 text/plain，其次将 text/html 转为
+        纯文本；非多部分邮件按内容类型直接取或转换。附件部分（content_disposition
+        为 attachment）被跳过。
+        """
         if msg.is_multipart():
             plain_parts: list[str] = []
             html_parts: list[str] = []
@@ -831,6 +939,9 @@ class EmailChannel(BaseChannel):
 
         Returns:
             A tuple of (spf_pass, dkim_pass) booleans.
+
+        解析 Authentication-Results 头中的 SPF/DKIM 结论：用正则匹配 ``spf=pass``
+        与 ``dkim=pass``。该头通常由接收方 MTA 注入，是判断发件人是否伪造的依据。
         """
         spf_pass = False
         dkim_pass = False
@@ -855,6 +966,10 @@ class EmailChannel(BaseChannel):
         """Extract and save email attachments to the media directory.
 
         Returns list of saved file paths.
+
+        提取并保存邮件附件到媒体目录：仅保存类型匹配 ``allowed_types``（支持 fnmatch
+        通配，如 ``image/*``）且未超大小/数量限制的附件，文件名经 ``safe_filename``
+        净化并以 UID 为前缀落盘，避免路径穿越与重名。
         """
         if not msg.is_multipart():
             return []
@@ -899,12 +1014,16 @@ class EmailChannel(BaseChannel):
 
     @staticmethod
     def _html_to_text(raw_html: str) -> str:
+        """将 HTML 粗略转为纯文本：把 <br>/</p> 转为换行、剥离其余标签、反转义实体。"""
+        # 先把 <br> 与 </p> 转成换行，保留段落结构
         text = re.sub(r"<\s*br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
         text = re.sub(r"<\s*/\s*p\s*>", "\n", text, flags=re.IGNORECASE)
+        # 再剥离所有剩余标签，最后把 &amp; 等 HTML 实体反转义回普通字符
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text)
 
     def _reply_subject(self, base_subject: str) -> str:
+        """构造回复主题：已带 Re: 前缀则原样返回，否则加上配置的前缀。"""
         subject = (base_subject or "").strip() or "nanobot reply"
         prefix = self.config.subject_prefix or "Re: "
         if subject.lower().startswith("re:"):

@@ -1,4 +1,10 @@
-"""Signal channel implementation using signal-cli daemon JSON-RPC interface."""
+"""Signal channel implementation using signal-cli daemon JSON-RPC interface.
+
+Signal 渠道实现：通过 signal-cli 守护进程（HTTP + JSON-RPC）收发消息。入站
+消息经 SSE（Server-Sent Events）流接收，出站消息走 JSON-RPC 的 send 方法。
+Signal 协议不原生支持 Markdown，本模块将 Markdown 转换为纯文本 + textStyle
+样式区间（offset/length 均以 UTF-16 code unit 计，因 Signal 的 BodyRange 语义如此）。
+"""
 
 from __future__ import annotations
 
@@ -28,6 +34,12 @@ from nanobot.utils.helpers import safe_filename, split_message
 
 @dataclass
 class _Run:
+    """Markdown 转换中的一段文本：携带文本、样式集合与"不透明"标记。
+
+    不透明片段（代码块/表格内容）跳过后续内联样式处理，避免其内容被
+    重复匹配（如代码块内的星号不会被误判为加粗）。
+    """
+
     text: str
     styles: frozenset[str] = field(default_factory=frozenset)
     opaque: bool = False  # code / table content — skip further pattern processing
@@ -45,7 +57,7 @@ _SIG_ITALIC_RE = re.compile(
     r"(?<!\*)\*([^*\n]+)\*(?!\*)|(?<![a-zA-Z0-9_])_([^_\n]+)_(?![a-zA-Z0-9_])"
 )
 _SIG_STRIKE_RE = re.compile(r"~~(.+?)~~|(?<![~\w])~([^~\n]+)~(?![~\w])", re.DOTALL)
-_SIG_TOKEN_RE = re.compile(r"\x00C(\d+)\x00")
+_SIG_TOKEN_RE = re.compile(r"\x00C(\d+)\x00")  # 匹配占位符 \x00C<idx>\x00，用于还原受保护的代码块/表格内容
 
 # Patterns used to strip inline markdown when rendering table cells as plain
 # text. Defined separately from the styling regexes above because the cell
@@ -61,27 +73,44 @@ _SIG_CELL_STRIP_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
 
 
 def _utf16_len(s: str) -> int:
-    """UTF-16 code-unit length, matching Signal BodyRange semantics."""
+    """UTF-16 code-unit length, matching Signal BodyRange semantics.
+
+    返回字符串的 UTF-16 code-unit 数。Signal 的 textStyle/BodyRange 以 UTF-16
+    code unit 计量偏移与长度，而 Python 的 len() 计的是码点；非 BMP 字符（如
+    部分 emoji）在 UTF-16 中占 2 个 unit，用 len() 会少算 1，故必须用此函数。
+    """
     return len(s.encode("utf-16-le")) // 2
 
 
 def _sig_strip_cell(s: str) -> str:
-    """Strip inline markdown from a table cell for plain-text rendering."""
+    """Strip inline markdown from a table cell for plain-text rendering.
+
+    去除表格单元格内的内联 Markdown（加粗/下划线/删除线/行内代码），仅保留
+    纯文本用于等宽渲染。只剥除窄子集（无双星斜体、无单波浪删除线），与完整
+    样式正则区分开，且每个模式的 group 1 即为要保留的内容。
+    """
     for pattern, repl in _SIG_CELL_STRIP_PATTERNS:
         s = pattern.sub(repl, s)
     return s.strip()
 
 
 def _sig_render_table(table_lines: list[str]) -> str:
-    """Render a markdown pipe-table as fixed-width plain text."""
+    """Render a markdown pipe-table as fixed-width plain text.
+
+    将 Markdown 管道表格渲染为等宽纯文本：去除首尾及单元格分隔的 ``|``，按
+    显示宽度（CJK 字符算 2 列）对齐各列，表头下方画横线分隔。若缺少合法的
+    分隔行则原样返回（不当作表格）。
+    """
 
     def dw(s: str) -> int:
+        # 显示宽度：East Asian Wide/Fullwidth 字符占 2 列，其余占 1 列
         return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
 
     rows: list[list[str]] = []
     has_sep = False
     for line in table_lines:
         cells = [_sig_strip_cell(c) for c in line.strip().strip("|").split("|")]
+        # 分隔行（形如 :--:、---、--:）只用于确认这是表格，不作为数据行
         if all(re.match(r"^:?-+:?$", c) for c in cells if c):
             has_sep = True
             continue
@@ -90,11 +119,14 @@ def _sig_render_table(table_lines: list[str]) -> str:
         return "\n".join(table_lines)
 
     ncols = max(len(r) for r in rows)
+    # 补齐列数不统一的行，避免后续按列取最大宽度时越界
     for r in rows:
         r.extend([""] * (ncols - len(r)))
+    # 每列取所有行中的最大显示宽度
     widths = [max(dw(r[c]) for r in rows) for c in range(ncols)]
 
     def dr(cells: list[str]) -> str:
+        # 按列宽用空格右补齐，列间以两个空格分隔
         return "  ".join(f"{c}{' ' * (w - dw(c))}" for c, w in zip(cells, widths))
 
     out = [dr(rows[0])]
@@ -109,21 +141,32 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
 
     Returns ``(plain_text, text_styles)`` where ``text_styles`` are
     ``"start:length:STYLE"`` strings for the signal-cli ``textStyle`` parameter.
+
+    将 Markdown 转换为 Signal 纯文本 + 样式区间，分三阶段：
+    1. 文本级：先用占位符替换代码块与表格，保护其内容不被内联样式处理；
+    2. 片段级：把文本拆成 ``_Run`` 片段，逐个正则匹配内联样式（加粗/斜体/
+       删除线/链接/列表/标题等），每个片段继承上层样式并叠加新样式；
+    3. 组装：拼接纯文本，按 UTF-16 偏移生成 ``start:length:STYLE`` 区间。
     """
     if not text:
         return text, []
 
     # Phase 1 (text-level): extract code blocks and tables with placeholder tokens
     # so they're protected from inline-style processing.
+    # 第一阶段（文本级）：用占位符 \x00C<idx>\x00 替换代码块与表格，存入 protected，
+    # 使其内容免受后续内联样式正则的误匹配。
     protected: list[str] = []
 
     def save_code(m: re.Match) -> str:
+        # 将代码块正文存入 protected，返回占位符，待 Phase 2 还原为 MONOSPACE 片段
         protected.append(m.group(1))
         return f"\x00C{len(protected) - 1}\x00"
 
     text = _SIG_CODE_BLOCK_RE.sub(save_code, text)
 
     # Detect and render pipe-tables line by line.
+    # 逐行检测管道表格（以 | 包裹的行）：连续表格行整体渲染为等宽纯文本；仅当
+    # 渲染结果与原文不同才替换为占位符，否则原样保留。
     lines = text.split("\n")
     rebuilt: list[str] = []
     i = 0
@@ -145,24 +188,32 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
     text = "\n".join(rebuilt)
 
     # Phase 2 (run-based): process inline patterns.
+    # 第二阶段（片段级）：把文本拆成 _Run 片段列表，对每个正则模式调用 transform，
+    # 在片段内查找匹配并把片段进一步切分为"匹配部分（应用新样式）"与"未匹配部分
+    # （继承原样式）"。opaque 片段（代码/表格）直接跳过，不参与任何内联匹配。
     runs: list[_Run] = [_Run(text)]
 
     def transform(
         pattern: re.Pattern,
         make_runs: Callable[[re.Match, frozenset[str]], list[_Run]],
     ) -> None:
+        # 对当前所有片段执行一次模式匹配：命中部分交给 make_runs 生成带新样式的
+        # 片段，未命中部分作为普通片段保留原样式；最终用新片段列表替换 runs。
         new_runs: list[_Run] = []
         for run in runs:
             if run.opaque:
+                # 不透明片段（代码/表格）整体保留，不再做内联匹配
                 new_runs.append(run)
                 continue
             pos = 0
             for m in pattern.finditer(run.text):
                 if m.start() > pos:
+                    # 匹配前的普通文本，继承当前片段样式
                     new_runs.append(_Run(run.text[pos : m.start()], run.styles))
                 new_runs.extend(make_runs(m, run.styles))
                 pos = m.end()
             if pos < len(run.text):
+                # 尾部剩余的普通文本
                 new_runs.append(_Run(run.text[pos:], run.styles))
         runs[:] = new_runs
 
@@ -188,6 +239,8 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
     transform(_SIG_OLIST_RE, lambda m, s: [_Run(m.group(1) + ". ", s)])
 
     # Links → "text (url)" or bare url when text equals url.
+    # 链接：当链接文本与 URL 归一化后相同（去掉协议/www/末尾斜杠并小写）时只保留
+    # URL，避免出现 "http://x.com (http://x.com)" 这种冗余形式；否则渲染为 "text (url)"。
     def _link_runs(m: re.Match, s: frozenset) -> list[_Run]:
         link_text, url = m.group(1), m.group(2)
 
@@ -201,6 +254,7 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
     transform(_SIG_LINK_RE, _link_runs)
 
     # Bold (before italic so ** doesn't interfere).
+    # 必须先处理加粗再处理斜体，否则 ** 会被斜体的单 * 规则错误匹配。
     transform(_SIG_BOLD_RE, lambda m, s: [_Run(m.group(1) or m.group(2), s | {"BOLD"})])
 
     # Italic (single * or _).
@@ -213,6 +267,8 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
     # units because Signal's BodyRange (via signal-cli's textStyle) interprets
     # them as such; Python's len() counts code points, which would shift ranges
     # left by 1 unit per non-BMP character preceding them.
+    # 第三阶段：组装输出。偏移与长度均以 UTF-16 code unit 计算（见上注）。逐片段
+    # 拼接纯文本，并按片段起始偏移与长度生成 "start:length:STYLE" 区间。
     plain_text = ""
     text_styles: list[str] = []
     utf16_offset = 0
@@ -220,7 +276,7 @@ def _markdown_to_signal(text: str) -> tuple[str, list[str]]:
         if not run.text:
             continue
         plain_text += run.text
-        start = utf16_offset
+        start = utf16_offset  # 本片段在纯文本中的 UTF-16 起始偏移
         length = _utf16_len(run.text)
         utf16_offset += length
         for style in sorted(run.styles):
@@ -241,6 +297,11 @@ def _partition_styles(
     rebased to each chunk's start. Ranges that span a boundary are split
     across the chunks they touch; ranges that fall entirely in trimmed
     whitespace are dropped.
+
+    中文说明：消息被 split_message 切成多段（边界处可能裁掉空白），而样式区间
+    的偏移是相对于完整 plain_text 的 UTF-16 偏移。本函数将区间重新分配到各段，
+    偏移改以各段起始为基准；跨越段边界的区间被拆分到相邻段；完全落在被裁空白
+    中的区间被丢弃。
     """
     if not chunks:
         return []
@@ -250,6 +311,8 @@ def _partition_styles(
     # Locate each chunk's UTF-16 start in plain_text. split_message lstrips at
     # boundaries (but not before the first chunk), so we skip whitespace
     # between chunks to mirror that.
+    # 先定位每段在 plain_text 中的 UTF-16 起止：用 codepoint 游标逐段推进，段间
+    # 跳过空白以模拟 split_message 在边界处左裁剪（首段不裁）的行为。
     chunk_ranges: list[tuple[int, int]] = []
     cursor = 0  # Python codepoint cursor in plain_text
     for i, chunk in enumerate(chunks):
@@ -266,6 +329,7 @@ def _partition_styles(
         s, ln, style = entry.split(":", 2)
         r_start = int(s)
         r_end = r_start + int(ln)
+        # 将区间与每段求交：无交集则跳过；有交集则把交集区间重定位到段内偏移
         for i, (c_start, c_end) in enumerate(chunk_ranges):
             if r_end <= c_start or r_start >= c_end:
                 continue
@@ -278,7 +342,11 @@ def _partition_styles(
 
 
 class SignalDMConfig(Base):
-    """Signal DM policy configuration."""
+    """Signal DM policy configuration.
+
+    Signal 私聊（DM）策略：``enabled`` 是否启用私聊响应；``policy`` 为
+    ``open``（放行所有私聊）或 ``allowlist``（仅允许 allow_from 中的号码/UUID）。
+    """
 
     enabled: bool = False
     policy: str = "allowlist"  # "open" or "allowlist"
@@ -286,7 +354,12 @@ class SignalDMConfig(Base):
 
 
 class SignalGroupConfig(Base):
-    """Signal group policy configuration."""
+    """Signal group policy configuration.
+
+    Signal 群组策略：``enabled`` 是否启用群组响应；``policy`` 为 ``open``
+    （所有群）或 ``allowlist``（仅 allow_from 中的群 ID）；``require_mention``
+    为 True 时需 @机器人 才回复（命令 / 开头始终响应）。
+    """
 
     enabled: bool = False
     policy: str = "allowlist"  # "open" or "allowlist" - which groups to operate in
@@ -295,7 +368,13 @@ class SignalGroupConfig(Base):
 
 
 class SignalConfig(Base):
-    """Signal channel configuration using signal-cli daemon (HTTP mode with -a flag only)."""
+    """Signal channel configuration using signal-cli daemon (HTTP mode with -a flag only).
+
+    Signal 渠道配置：依赖 signal-cli 守护进程以 ``-a`` 指定账号、``--http`` 启动。
+    ``phone_number`` 为机器人账号；``daemon_host/port`` 为守护进程地址；``dm``/``group``
+    分别为私聊与群组子策略；``attachments_dir`` 覆盖入站附件目录；``group_message_buffer_size``
+    控制群组上下文缓冲条数。
+    """
 
     enabled: bool = False
     phone_number: str = ""  # Your Signal phone number (e.g., "+1234567890")
@@ -325,6 +404,10 @@ class SignalConfig(Base):
         Returns the union of dm.allow_from and group.allow_from so the base
         channel gate sees a populated list when either sub-policy is configured.
         A ``"*"`` wildcard in either sub-list propagates to allow all.
+
+        中文：返回 dm.allow_from 与 group.allow_from 的并集（去重保序），使基类
+        is_allowed() 在任一子策略配置了 allow_from 时都能看到非空列表；任一子列表
+        含 ``"*"`` 通配则放行所有。
         """
         return list(dict.fromkeys(self.dm.allow_from + self.group.allow_from))
 

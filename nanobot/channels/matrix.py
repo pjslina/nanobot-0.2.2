@@ -1,4 +1,9 @@
-"""Matrix (Element) channel — inbound sync + outbound message/media delivery."""
+"""Matrix (Element) channel — inbound sync + outbound message/media delivery.
+
+基于 matrix-nio 的 Matrix/Element 渠道：通过长轮询 sync 接收入站消息；
+出站支持文本（Markdown 转 HTML）、媒体上传/下载与端到端加密（E2EE）；
+并实现按 chat_id 维护的有状态流式编辑--复用同一 event_id 反复编辑同一条消息。
+"""
 
 import asyncio
 import json
@@ -58,6 +63,7 @@ from nanobot.utils.logging_bridge import redirect_lib_logging
 
 TYPING_NOTICE_TIMEOUT_MS = 30_000
 # Must stay below TYPING_NOTICE_TIMEOUT_MS so the indicator doesn't expire mid-processing.
+# 必须小于 TYPING_NOTICE_TIMEOUT_MS，否则 typing 指示器会在处理过程中过期。
 TYPING_KEEPALIVE_INTERVAL_MS = 20_000
 MATRIX_HTML_FORMAT = "org.matrix.custom.html"
 _ATTACH_MARKER = "[attachment: {}]"
@@ -93,7 +99,12 @@ MATRIX_ALLOWED_URL_SCHEMES = {"https", "http", "matrix", "mailto", "mxc"}
 
 
 def _filter_matrix_html_attribute(tag: str, attr: str, value: str) -> str | None:
-    """Filter attribute values to a safe Matrix-compatible subset."""
+    """Filter attribute values to a safe Matrix-compatible subset.
+
+    nh3 的 attribute_filter：对 a[href]/img[src]/code[class] 做白名单校验
+    （href 限 http/https/matrix/mailto，src 限 mxc://，class 仅保留 language-*），
+    其余属性原样返回，由 nh3 的 attributes 白名单决定是否保留。
+    """
     if tag == "a" and attr == "href":
         return value if value.lower().startswith(("https://", "http://", "matrix:", "mailto:")) else None
     if tag == "img" and attr == "src":
@@ -125,13 +136,20 @@ class _StreamBuf:
     :type event_id: str | None
     :ivar last_edit: Timestamp of the most recent edit to the buffer.
     :type last_edit: float
+
+    流式响应缓冲区：累积 LLM 增量文本，记录已发出的 event_id（首次发送后固定，
+    后续分块通过 m.replace 编辑同一条消息）与上次编辑时间（用于节流，避免频繁编辑）。
     """
     text: str = ""
     event_id: str | None = None
     last_edit: float = 0.0
 
 def _render_markdown_html(text: str) -> str | None:
-    """Render markdown to sanitized HTML; returns None for plain text."""
+    """Render markdown to sanitized HTML; returns None for plain text.
+
+    将 Markdown 渲染为经 nh3 清理的 HTML；纯文本（无任何 Markdown 元素）时返回 None，
+    以避免在 Matrix 消息中附带多余的 formatted_body。
+    """
     try:
         formatted = MATRIX_HTML_CLEANER.clean(MATRIX_MARKDOWN(text)).strip()
     except Exception:
@@ -139,6 +157,7 @@ def _render_markdown_html(text: str) -> str | None:
     if not formatted:
         return None
     # Skip formatted_body for plain <p>text</p> to keep payload minimal.
+    # 仅 <p>纯文本</p> 时无需 formatted_body，保持 payload 最小
     if formatted.startswith("<p>") and formatted.endswith("</p>"):
         inner = formatted[3:-4]
         if "<" not in inner and ">" not in inner:
@@ -168,6 +187,10 @@ def _build_matrix_text_content(
     :return: A dictionary containing the matrix text content, potentially enriched with
         HTML formatting and replacement metadata if applicable.
     :rtype: dict[str, object]
+
+    构造 Matrix m.room.message 文本内容：附带可选 formatted_body（HTML）。
+    当传入 event_id 时生成 m.replace 关系（编辑/替换既有消息），新内容放在 m.new_content 中；
+    thread_relates_to 用于把编辑保留在同一 thread 内。
     """
     content: dict[str, object] = {"msgtype": "m.text", "body": text, "m.mentions": {}}
     if html := _render_markdown_html(text):
@@ -191,7 +214,12 @@ def _build_matrix_text_content(
 
 
 class MatrixConfig(Base):
-    """Matrix (Element) channel configuration."""
+    """Matrix (Element) channel configuration.
+
+    Matrix 渠道配置。登录支持 password 或 access_token+device_id 两种方式；
+    e2ee_enabled 开启端到端加密（默认开启），sas_verification 开启交互式 SAS 验签；
+    group_policy 控制群组消息响应策略（open/mention/allowlist）。
+    """
 
     enabled: bool = False
     homeserver: str = "https://matrix.org"
@@ -200,19 +228,24 @@ class MatrixConfig(Base):
     access_token: str = ""
     device_id: str = ""
     e2ee_enabled: bool = Field(default=True, alias="e2eeEnabled")
-    sas_verification: bool = Field(default=False, alias="sasVerification")
-    sync_stop_grace_seconds: int = 2
-    max_media_bytes: int = 20 * 1024 * 1024
-    max_concurrent_media_downloads: int = 2
+    sas_verification: bool = Field(default=False, alias="sasVerification")  # 是否自动应答 SAS 短认证字符串验证（需 e2ee_enabled）
+    sync_stop_grace_seconds: int = 2  # 停止时等待 sync_loop 优雅退出的宽限秒数
+    max_media_bytes: int = 20 * 1024 * 1024  # 单条媒体大小上限（与服务器上传限制取最小值）
+    max_concurrent_media_downloads: int = 2  # 入站媒体并发下载数上限（信号量）
     allow_from: list[str] = Field(default_factory=list)
-    group_policy: Literal["open", "mention", "allowlist"] = "open"
+    group_policy: Literal["open", "mention", "allowlist"] = "open"  # 群组响应策略：open=全部、mention=仅@、allowlist=仅 group_allow_from
     group_allow_from: list[str] = Field(default_factory=list)
-    allow_room_mentions: bool = False
+    allow_room_mentions: bool = False  # 群内 room 级 @mention（m.mentions.room=true）是否视为被提及
     streaming: bool = False
 
 
 class MatrixChannel(BaseChannel):
-    """Matrix (Element) channel using long-polling sync."""
+    """Matrix (Element) channel using long-polling sync.
+
+    基于 matrix-nio 的长轮询 sync 渠道。入站通过 sync_forever 监听房间事件，
+    出站发送文本/媒体；流式输出通过反复编辑同一条消息（m.replace）实现，
+    并维护 typing keepalive 指示器与 SAS 验签流程。
+    """
 
     name = "matrix"
     display_name = "Matrix"

@@ -5,6 +5,12 @@ No WebSocket, no local WeChat client needed — just HTTP requests with a
 bot token obtained via QR code login.
 
 Protocol reverse-engineered from ``@tencent-weixin/openclaw-weixin`` v1.0.3.
+
+本模块为个人微信渠道实现：基于 ilinkai.weixin.qq.com 的 HTTP 长轮询 API 收发消息，
+无需 WebSocket、无需本地微信客户端，只需通过扫码登录获取 bot token 即可接入。
+协议逆向自 ``@tencent-weixin/openclaw-weixin`` v1.0.3 参考插件。媒体收发均经
+AES-128-ECB 加解密；出站受 iLink 限流（约 7 条/5 分钟）约束，需合并工具提示、
+跳过不可见的推理分块，并在发送前主动刷新易过期的 context_token。
 """
 
 from __future__ import annotations
@@ -119,7 +125,13 @@ def _has_downloadable_media_locator(media: dict[str, Any] | None) -> bool:
 
 
 class WeixinConfig(Base):
-    """Personal WeChat channel configuration."""
+    """Personal WeChat channel configuration.
+
+    个人微信渠道配置。``token`` 可手动填写或经扫码登录获取；``state_dir`` 用于
+    持久化账号状态（token、长轮询游标、context_token、typing ticket 等），默认
+    ``~/.nanobot/weixin/``；``route_tag`` 为可选的服务端路由标记；``poll_timeout``
+    为长轮询超时，可被服务端下发的 longpolling_timeout_ms 动态覆盖。
+    """
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
@@ -138,6 +150,12 @@ class WeixinChannel(BaseChannel):
     Connects to ilinkai.weixin.qq.com API to receive and send personal
     WeChat messages. Authentication is via QR code login which produces
     a bot token.
+
+    个人微信渠道：通过 HTTP 长轮询连接 ilinkai.weixin.qq.com API 收发消息，使用
+    扫码登录获取 bot token 完成鉴权。入站消息经长轮询拉取后下载/解密媒体并转写
+    语音；出站消息在发送前需刷新可能过期的 context_token，并按约 7 条/5 分钟的
+    iLink 限流策略合并工具提示、跳过不可见的推理分块。所有有状态缓冲（游标、
+    去重、token 缓存、typing ticket、工具提示合并）均按会话维度维护。
     """
 
     name = "weixin"
@@ -155,18 +173,18 @@ class WeixinChannel(BaseChannel):
 
         # State
         self._client: httpx.AsyncClient | None = None
-        self._get_updates_buf: str = ""
-        self._context_tokens: dict[str, str] = {}  # from_user_id -> context_token
-        self._processed_ids: OrderedDict[str, None] = OrderedDict()
+        self._get_updates_buf: str = ""  # 长轮询游标，服务端据此返回增量消息
+        self._context_tokens: dict[str, str] = {}  # from_user_id -> context_token（回复消息必需）
+        self._processed_ids: OrderedDict[str, None] = OrderedDict()  # 消息去重，超 1000 条按 FIFO 淘汰
         self._state_dir: Path | None = None
         self._token: str = ""
         self._poll_task: asyncio.Task | None = None
-        self._next_poll_timeout_s: int = DEFAULT_LONG_POLL_TIMEOUT_S
-        self._session_pause_until: float = 0.0
-        self._typing_tasks: dict[str, asyncio.Task] = {}
-        self._typing_tickets: dict[str, dict[str, Any]] = {}
-        self._context_token_at: dict[str, float] = {}
-        self._pending_tool_hints: dict[str, list[str]] = {}
+        self._next_poll_timeout_s: int = DEFAULT_LONG_POLL_TIMEOUT_S  # 可被服务端 longpolling_timeout_ms 动态调整
+        self._session_pause_until: float = 0.0  # 会话过期(errcode -14)后暂停拉取的时间戳
+        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing 保活协程
+        self._typing_tickets: dict[str, dict[str, Any]] = {}  # chat_id -> ticket 缓存（含失败退避）
+        self._context_token_at: dict[str, float] = {}  # context_token 缓存时间戳，用于判定是否过期需刷新
+        self._pending_tool_hints: dict[str, list[str]] = {}  # 工具提示合并缓冲，规避限流
 
     # ------------------------------------------------------------------
     # State persistence
@@ -184,7 +202,11 @@ class WeixinChannel(BaseChannel):
         return d
 
     def _load_state(self) -> bool:
-        """Load saved account state. Returns True if a valid token was found."""
+        """Load saved account state. Returns True if a valid token was found.
+
+        从 account.json 读取已保存的账号状态（token、长轮询游标、context_token、
+        typing ticket、base_url）；仅当存在有效 token 时返回 True。
+        """
         state_file = self._get_state_dir() / "account.json"
         if not state_file.exists():
             return False
@@ -245,7 +267,11 @@ class WeixinChannel(BaseChannel):
         return base64.b64encode(str(uint32).encode()).decode()
 
     def _make_headers(self, *, auth: bool = True) -> dict[str, str]:
-        """Build per-request headers (new UIN each call, matching reference)."""
+        """Build per-request headers (new UIN each call, matching reference).
+
+        构造每请求的 HTTP 头：每次调用都重新生成 X-WECHAT-UIN（与参考插件一致），
+        ``auth=True`` 时附带 Bearer token，``route_tag`` 非空时注入 SKRouteTag。
+        """
         headers: dict[str, str] = {
             "X-WECHAT-UIN": self._random_wechat_uin(),
             "Content-Type": "application/json",
@@ -315,6 +341,7 @@ class WeixinChannel(BaseChannel):
         url = f"{self.config.base_url}/{endpoint}"
         payload = body or {}
         if "base_info" not in payload:
+            # 协议要求每个 POST body 都携带 base_info（含渠道版本号），缺失则补默认值
             payload["base_info"] = BASE_INFO
         resp = await self._client.post(url, json=payload, headers=self._make_headers(auth=auth))
         resp.raise_for_status()
@@ -338,7 +365,14 @@ class WeixinChannel(BaseChannel):
         return qrcode_id, (qrcode_img_content or qrcode_id)
 
     async def _qr_login(self) -> bool:
-        """Perform QR code login flow. Returns True on success."""
+        """Perform QR code login flow. Returns True on success.
+
+        扫码登录流程：拉取二维码并打印后，轮询 get_qrcode_status：
+        ``confirmed`` 取 bot_token 并保存；``scaned_but_redirect`` 切换到
+        redirect_host 继续轮询；``expired`` 重新拉取二维码（最多刷新
+        MAX_QR_REFRESH_COUNT 次）；``wait`` 继续轮询。可重试的网络错误 sleep
+        后重试，其余异常向上抛出。
+        """
         try:
             refresh_count = 0
             qrcode_id, scan_url = await self._fetch_qr_code()
@@ -441,7 +475,12 @@ class WeixinChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def login(self, force: bool = False) -> bool:
-        """Perform QR code login and save token. Returns True on success."""
+        """Perform QR code login and save token. Returns True on success.
+
+        交互式登录入口：``force=True`` 时清空已有 token 与状态文件强制重登；
+        若已有 token 或能从状态文件加载到有效 token 则直接返回 True，否则临时
+        创建 HTTP 客户端执行扫码登录流程并在结束后关闭客户端。
+        """
         if force:
             self._token = ""
             self._get_updates_buf = ""
@@ -466,6 +505,12 @@ class WeixinChannel(BaseChannel):
                 self._client = None
 
     async def start(self) -> None:
+        """Start the long-poll receive loop.
+
+        渠道启动：创建 HTTP 客户端，加载或扫码获取 token，随后进入长轮询主循环。
+        单次超时视为正常；连续失败累计达 MAX_CONSECUTIVE_FAILURES 次后退避
+        BACKOFF_DELAY_S 秒，否则短退避 RETRY_DELAY_S 秒后重试。
+        """
         self._running = True
         self._next_poll_timeout_s = self.config.poll_timeout
         self._client = httpx.AsyncClient(
@@ -503,6 +548,11 @@ class WeixinChannel(BaseChannel):
                     await asyncio.sleep(RETRY_DELAY_S)
 
     async def stop(self) -> None:
+        """Stop the channel and clean up resources.
+
+        停止渠道：清除工具提示缓冲、取消轮询任务、停止所有 typing 保活协程
+        （不向远端发送 cancel，因为客户端即将关闭）、关闭 HTTP 客户端，并持久化状态。
+        """
         self._running = False
         self._pending_tool_hints.clear()
         if self._poll_task and not self._poll_task.done():

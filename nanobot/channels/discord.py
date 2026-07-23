@@ -1,4 +1,9 @@
-"""Discord channel implementation using discord.py."""
+"""Discord channel implementation using discord.py.
+
+基于 discord.py 的 Discord 渠道实现：通过 WebSocket 网关接收消息，
+出站时利用 Discord“首条发送 + 后续就地编辑”的特性实现流式输出
+（send_delta），并支持斜杠命令、线程会话隔离、附件收发与已读/处理中表情反馈。
+"""
 
 from __future__ import annotations
 
@@ -32,14 +37,19 @@ if DISCORD_AVAILABLE:
     from discord import app_commands
     from discord.abc import Messageable
 
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
-MAX_MESSAGE_LEN = 2000  # Discord message character limit
-TYPING_INTERVAL_S = 8
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB  # Discord 单个附件大小上限（20MB）
+MAX_MESSAGE_LEN = 2000  # Discord message character limit  # Discord 单条消息字符数上限，超出需分片
+TYPING_INTERVAL_S = 8  # typing 指示器刷新间隔（秒）；Discord 的 typing 状态约 10s 自动消失，故每 8s 重新触发
 
 
 @dataclass
 class _StreamBuf:
-    """Per-chat streaming accumulator for progressive Discord message edits."""
+    """Per-chat streaming accumulator for progressive Discord message edits.
+
+    单会话流式缓冲：累积 LLM 增量文本，并持有已发送的那条 Discord 消息对象，
+    以便通过就地编辑（edit）实现“边生成边更新”的流式效果。stream_id 用于区分
+    多条并发流，避免不同流的增量相互覆盖。
+    """
 
     text: str = ""
     message: Any | None = None
@@ -48,27 +58,36 @@ class _StreamBuf:
 
 
 class DiscordConfig(Base):
-    """Discord channel configuration."""
+    """Discord channel configuration.
+
+    Discord 渠道配置。intents 为 Discord Gateway 的权限位掩码（默认 37377
+    覆盖 guilds/message_content 等所需意图）；group_policy 控制群聊响应策略
+    （mention=仅在被 @ 或回复机器人时响应，open=全部响应）。
+    """
 
     enabled: bool = False
     token: str = ""
     allow_from: list[str] = Field(default_factory=list)
-    allow_channels: list[str] = Field(default_factory=list)  # Allowed channel IDs (empty = all)
-    intents: int = 37377
+    allow_channels: list[str] = Field(default_factory=list)  # Allowed channel IDs (empty = all)  # 允许的频道 ID（空=不限频道）
+    intents: int = 37377  # Discord Gateway intents 位掩码
     group_policy: Literal["mention", "open"] = "mention"
-    read_receipt_emoji: str = "👀"
-    working_emoji: str = "🔧"
-    working_emoji_delay: float = 2.0
-    streaming: bool = True
-    proxy: str | None = None
-    proxy_username: str | None = None
-    proxy_password: str | None = None
+    read_receipt_emoji: str = "👀"  # 收到消息时立刻添加的“已读”表情
+    working_emoji: str = "🔧"  # 处理中表情，延迟添加以避免短任务闪烁
+    working_emoji_delay: float = 2.0  # 处理中表情的延迟添加时间（秒）
+    streaming: bool = True  # 是否启用流式（就地编辑）输出
+    proxy: str | None = None  # HTTP(S) 代理地址
+    proxy_username: str | None = None  # 代理认证用户名（须与 proxy_password 同时设置）
+    proxy_password: str | None = None  # 代理认证密码
 
 
 if DISCORD_AVAILABLE:
 
     class DiscordBotClient(discord.Client):
-        """discord.py client that forwards events to the channel."""
+        """discord.py client that forwards events to the channel.
+
+        自定义 discord.Client：将 Discord 事件（消息、线程变更、斜杠命令）
+        转发给所属 DiscordChannel 处理，并承载出站发送（send_outbound）逻辑。
+        """
 
         def __init__(
             self,
@@ -87,6 +106,7 @@ if DISCORD_AVAILABLE:
             self._channel._bot_user_id = str(self.user.id) if self.user else None
             self._channel.logger.info("bot connected as user {}", self._channel._bot_user_id)
             try:
+                # 同步斜杠命令到 Discord，使 /new /stop 等出现在命令补全中
                 synced = await self.tree.sync()
                 self._channel.logger.info("app commands synced: {}", len(synced))
             except Exception as e:
@@ -96,16 +116,21 @@ if DISCORD_AVAILABLE:
             await self._channel._handle_discord_message(message)
 
         async def on_thread_delete(self, thread: discord.Thread) -> None:
+            # 线程被删除时清理本地缓存，避免向已失效的频道发送
             self._channel._forget_channel(thread)
 
         async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
             if getattr(after, "archived", False):
+                # 线程归档后不再可用，移出缓存
                 self._channel._forget_channel(after)
             else:
                 self._channel._remember_channel(after)
 
         async def _reply_ephemeral(self, interaction: discord.Interaction, text: str) -> bool:
-            """Send an ephemeral interaction response and report success."""
+            """Send an ephemeral interaction response and report success.
+
+            发送仅调用者可见的临时（ephemeral）斜杠命令回复，用于权限/状态提示。
+            """
             try:
                 await interaction.response.send_message(text, ephemeral=True)
                 return True
@@ -123,6 +148,7 @@ if DISCORD_AVAILABLE:
             channel = getattr(interaction, "channel", None) or self.get_channel(channel_id)
             if channel is None:
                 try:
+                    # 缓存未命中时回退到网络拉取
                     channel = await self.fetch_channel(channel_id)
                 except Exception as e:
                     self._channel.logger.warning("interaction channel {} unavailable: {}", channel_id, e)
@@ -137,10 +163,12 @@ if DISCORD_AVAILABLE:
         ) -> bool:
             allow_channels = self._channel.config.allow_channels
             if not allow_channels:
+                # 未配置 allow_channels 表示不限频道
                 return True
             if channel is None:
                 channel_id = interaction.channel_id
                 return channel_id is not None and str(channel_id) in allow_channels
+            # 线程的父频道也算作允许键，故用 _channel_allow_keys 同时匹配自身与父频道
             channel_ids = self._channel._channel_allow_keys(channel)
             return not channel_ids.isdisjoint(allow_channels)
 
@@ -176,6 +204,8 @@ if DISCORD_AVAILABLE:
             if channel is not None:
                 parent_channel_id = self._channel._channel_parent_key(channel)
                 if parent_channel_id is not None:
+                    # 斜杠命令发生在线程内：记录父子频道关系，并把会话键绑定到线程，
+                    # 使同一线程内的对话拥有独立会话上下文
                     metadata["parent_channel_id"] = parent_channel_id
                     metadata["context_chat_id"] = parent_channel_id
                     metadata["thread_id"] = str(channel_id)
@@ -203,6 +233,8 @@ if DISCORD_AVAILABLE:
                 @self.tree.command(name=name, description=description)
                 async def command_handler(
                     interaction: discord.Interaction,
+                    # 闭包陷阱：用默认参数绑定当前循环值 command_text，
+                    # 否则所有 handler 都会捕获循环结束时的最后一个 command_text
                     _command_text: str = command_text,
                 ) -> None:
                     await self._forward_slash_command(interaction, _command_text)

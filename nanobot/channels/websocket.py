@@ -1,4 +1,11 @@
-"""WebSocket server channel: nanobot acts as a WebSocket server and serves connected clients."""
+"""WebSocket server channel: nanobot acts as a WebSocket server and serves connected clients.
+
+本模块实现 nanobot 内置的 WebSocket 服务端渠道，同时承载 WebUI 网关：除了收发
+聊天消息，它还在同一个 HTTP/WS 端口上复用 token 签发、媒体签名、会话/工作区
+范围控制、转录等子服务。客户端通过 ``ws://{host}:{port}{path}?client_id=...&token=...``
+建立连接，每条连接拥有独立会话（``chat_id``），出站消息按 ``chat_id`` 扇出给所有
+订阅该会话的连接，实现多端实时同步与刷新续接。
+"""
 
 from __future__ import annotations
 
@@ -68,6 +75,12 @@ class WebSocketConfig(Base):
     - Each connection has its own session: a unique ``chat_id`` maps to the agent session internally.
     - ``media`` field in outbound messages contains local filesystem paths; remote clients need a
       shared filesystem or an HTTP file server to access these files.
+
+    中文说明：WebSocket 服务端渠道的配置。鉴权分三层——``token`` 为静态密钥，
+    ``token_issue_path`` 用于签发短期令牌（带 TTL），``token_issue_secret`` 用于保护签发
+    接口；当 ``host`` 绑定到 0.0.0.0/:: 时必须配置鉴权以防公网裸奔。``unix_socket_path``
+    非空时优先走 Unix 域套接字（适合同机/容器内部通信）。``max_message_bytes`` 默认
+    36 MB，按 4 张图 × 6 MB × 1.37 base64 开销估算，留有上限余量以兼顾大图与 DoS 防护。
     """
 
     enabled: bool = False
@@ -147,7 +160,12 @@ def publish_runtime_model_update(
     model: str,
     model_preset: str | None,
 ) -> None:
-    """Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel)."""
+    """Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
+
+    中文说明：向出站队列投放一条 ``_runtime_model_updated`` 广播消息（chat_id="*"），
+    由 websocket 渠道的 send() 在通道内扇出给所有在线连接，用于通知 WebUI 运行时
+    切换了模型/预设。
+    """
     bus.outbound.put_nowait(OutboundMessage(
         channel="websocket",
         chat_id="*",
@@ -161,7 +179,12 @@ def publish_runtime_model_update(
 
 
 def _parse_inbound_payload(raw: str) -> str | None:
-    """Parse a client frame into text; return None for empty or unrecognized content."""
+    """Parse a client frame into text; return None for empty or unrecognized content.
+
+    中文说明：把客户端帧解析为文本，供旧式（无 ``type`` 字段）消息回退使用。
+    优先尝试 JSON 解析，并依次取 ``content``/``text``/``message`` 字段；非 JSON
+    或空内容则返回 None。新式带 ``type`` 的信封由 :func:`_parse_envelope` 处理。
+    """
     text = raw.strip()
     if not text:
         return None
@@ -182,6 +205,8 @@ def _parse_inbound_payload(raw: str) -> str | None:
 
 # Accept UUIDs and short scoped keys like "unified:default". Keeps the capability
 # namespace small enough to rule out path traversal / quote injection tricks.
+# 仅接受 UUID 及短作用域键（如 "unified:default"），命名空间足够小以杜绝路径穿越 /
+# 引号注入等攻击；chat_id 经此校验后才允许用作订阅键。
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,64}$")
 
 
@@ -195,6 +220,11 @@ def _parse_envelope(raw: str) -> dict[str, Any] | None:
     A frame qualifies when it parses as a JSON object with a string ``type`` field.
     Legacy frames (plain text, or ``{"content": ...}`` without ``type``) return None;
     callers should fall back to :func:`_parse_inbound_payload` for those.
+
+    中文说明：判定一帧是否为新式带 ``type`` 的 JSON 信封。仅当解析为 JSON 对象且
+    含字符串 ``type`` 字段时返回该字典；旧式纯文本或 ``{"content":...}`` 返回 None，
+    由调用方回退到 :func:`_parse_inbound_payload` 处理。这样可在同一连接上兼容
+    旧客户端与新 WebUI 协议。
     """
     text = raw.strip()
     if not text.startswith("{"):
@@ -219,6 +249,9 @@ _MAX_IMAGES_PER_MESSAGE = 4
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEOS_PER_MESSAGE = 1
 _MAX_VIDEO_BYTES = 20 * 1024 * 1024
+# 中文：单条消息的媒体上限。服务端护栏比客户端 Worker 的归一化目标（6 MB）略宽，
+# 以容忍客户端抖动，但总入站量仍受 _MAX_IMAGES_PER_MESSAGE * _MAX_IMAGE_BYTES 封顶，
+# 且整体落在 max_message_bytes 之内。
 
 # Image MIME whitelist — matches the Composer's ``accept`` list. SVG is
 # explicitly excluded to avoid the XSS surface inside embedded scripts.
@@ -228,6 +261,7 @@ _IMAGE_MIME_ALLOWED: frozenset[str] = frozenset({
     "image/webp",
     "image/gif",
 })
+# 中文：显式排除 SVG，以规避其内嵌 <script> 带来的 XSS 攻击面。
 
 _VIDEO_MIME_ALLOWED: frozenset[str] = frozenset({
     "video/mp4",
@@ -241,7 +275,11 @@ _DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
 
 
 def _extract_data_url_mime(url: str) -> str | None:
-    """Return the MIME type of a ``data:<mime>;base64,...`` URL, else ``None``."""
+    """Return the MIME type of a ``data:<mime>;base64,...`` URL, else ``None``.
+
+    中文说明：用正则从 data URL 中提取 MIME 类型（小写归一化），用于在解码前
+    校验白名单与统计图片/视频数量；不匹配则返回 None。
+    """
     if not isinstance(url, str):
         return None
     m = _DATA_URL_MIME_RE.match(url)
@@ -251,7 +289,12 @@ def _extract_data_url_mime(url: str) -> str | None:
 
 
 def _is_websocket_upgrade(request: WsRequest) -> bool:
-    """Detect an actual WS upgrade; plain HTTP GETs to the same path should fall through."""
+    """Detect an actual WS upgrade; plain HTTP GETs to the same path should fall through.
+
+    中文说明：判断是否为真正的 WebSocket 升级请求。同一 ``path`` 上既可能来 WS
+    升级也可能来普通 HTTP GET（如 token 签发、静态资源），故需同时校验
+    ``Upgrade: websocket`` 与 ``Connection: upgrade`` 头，否则交由 HTTP 路由处理。
+    """
     upgrade = request.headers.get("Upgrade") or request.headers.get("upgrade")
     connection = request.headers.get("Connection") or request.headers.get("connection")
     if not upgrade or "websocket" not in upgrade.lower():
@@ -262,7 +305,13 @@ def _is_websocket_upgrade(request: WsRequest) -> bool:
 
 
 class WebSocketChannel(BaseChannel):
-    """Run a local WebSocket server; forward text/JSON messages to the message bus."""
+    """Run a local WebSocket server; forward text/JSON messages to the message bus.
+
+    中文说明：本地 WebSocket 服务端渠道，同时是 WebUI 网关的承载者。维护两张订阅
+    表（``_subs``: chat_id -> 连接集合，``_conn_chats``: 连接 -> chat_id 集合）以
+    支持 O(1) 扇出与断连清理；入站帧区分新式信封与旧式纯文本，出站消息按 metadata
+    标记分流为流式分块/推理/进度/工具/会话更新等多种事件并扇出给订阅者。
+    """
 
     name = "websocket"
     display_name = "WebSocket"
@@ -294,6 +343,8 @@ class WebSocketChannel(BaseChannel):
         self._transcripts = gateway.transcripts
         self._workspaces = gateway.workspaces
 
+        # 流式分块的有状态缓冲：键为 (chat_id, stream_id)，值为该流已累积的文本分块列表。
+        # 仅在 _stream_end 时取出合并、做本地图片路径重写后一次性下发，避免中间帧重复重写。
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
 
     # -- Subscription bookkeeping -------------------------------------------
@@ -302,12 +353,20 @@ class WebSocketChannel(BaseChannel):
         return self._http_router.workspace_controls_available(connection)
 
     def _attach(self, connection: Any, chat_id: str) -> None:
-        """Idempotently subscribe *connection* to *chat_id*."""
+        """Idempotently subscribe *connection* to *chat_id*.
+
+        中文说明：幂等地把连接订阅到 chat_id，同时维护正反向两张表（_subs 与
+        _conn_chats），便于断连时 O(1) 清理。
+        """
         self._subs.setdefault(chat_id, set()).add(connection)
         self._conn_chats.setdefault(connection, set()).add(chat_id)
 
     def _cleanup_connection(self, connection: Any) -> None:
-        """Remove *connection* from every subscription set; safe to call multiple times."""
+        """Remove *connection* from every subscription set; safe to call multiple times.
+
+        中文说明：连接断开时从所有订阅集合中移除该连接，并清理其默认 chat_id。
+        空集合随之删除以避免内存泄漏；多次调用安全。
+        """
         chat_ids = self._conn_chats.pop(connection, set())
         for cid in chat_ids:
             subs = self._subs.get(cid)
@@ -324,6 +383,10 @@ class WebSocketChannel(BaseChannel):
         Goal metadata lives on the session JSONL and survives gateway restarts, but
         connected clients normally see it via ``goal_state`` / ``turn_end`` frames.
         Pushing here makes refresh + reconnect restore the strip without a new model turn.
+
+        中文说明：订阅完成后回放“激活态持续目标”。目标元数据持久化在会话 JSONL 中，
+        跨网关重启仍存在，但客户端通常要通过 goal_state/turn_end 帧才能看到；此处主动
+        推送，使刷新或重连后无需新的一轮对话即可恢复目标状态条。
         """
         if self.gateway.session_manager is None:
             return
@@ -337,19 +400,31 @@ class WebSocketChannel(BaseChannel):
         await self.send_goal_state(chat_id, blob)
 
     async def _maybe_push_turn_run_wall_clock(self, chat_id: str) -> None:
-        """Replay ``goal_status: running`` when a turn is still active (same-process refresh)."""
+        """Replay ``goal_status: running`` when a turn is still active (same-process refresh).
+
+        中文说明：同进程刷新场景下，若某轮对话仍在运行（wall-clock 起始时间存在），
+        则重放 ``goal_status: running``，让客户端立即恢复“运行中”状态条。
+        """
         t0 = websocket_turn_wall_started_at(chat_id)
         if t0 is None:
             return
         await self.send_goal_status(chat_id, "running", started_at=t0)
 
     async def _hydrate_after_subscribe(self, chat_id: str) -> None:
-        """Replay goal/run strip state after subscribe (same-process refresh)."""
+        """Replay goal/run strip state after subscribe (same-process refresh).
+
+        中文说明：订阅后的状态水合（hydrate）--依次回放激活目标与运行中状态条，
+        使刷新/重连的客户端无需新对话即可恢复 UI 上下文。
+        """
         await self._maybe_push_active_goal_state(chat_id)
         await self._maybe_push_turn_run_wall_clock(chat_id)
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
-        """Send a control event (attached, error, ...) to a single connection."""
+        """Send a control event (attached, error, ...) to a single connection.
+
+        中文说明：向单个连接发送控制事件（attached/error/session_updated 等）。
+        发送失败时若是连接已关闭则清理订阅，其他异常仅记录告警，不向调用方抛出。
+        """
         payload: dict[str, Any] = {"event": event}
         payload.update(fields)
         raw = json.dumps(payload, ensure_ascii=False)
@@ -384,7 +459,12 @@ class WebSocketChannel(BaseChannel):
     # -- HTTP dispatch ------------------------------------------------------
 
     async def _dispatch_http(self, connection: Any, request: WsRequest) -> Any:
-        """Route an inbound HTTP request to the HTTP handler or WS upgrade."""
+        """Route an inbound HTTP request to the HTTP handler or WS upgrade.
+
+        中文说明：同一端口复用 HTTP 与 WS。先解析路径，若命中 WS 升级路径且确为
+        WS 升级请求，则做 client_id 鉴权（is_allowed）后进入握手鉴权；其余请求一律
+        交给 HTTP 路由器（token 签发、静态资源、API 等）。
+        """
         got, query = _parse_request_path(request.path)
 
         # WebSocket upgrade — channel handles this itself
@@ -398,9 +478,15 @@ class WebSocketChannel(BaseChannel):
             return self._authorize_websocket_handshake(connection, query)
 
         # Everything else goes to the HTTP handler
+        # 中文：其余请求交给 HTTP 路由器
         return await self._http_router.dispatch(connection, request)
 
     def _authorize_websocket_handshake(self, connection: Any, query: dict[str, list[str]]) -> Any:
+        # 中文：握手阶段令牌鉴权，分三种配置组合：
+        #   1) 配置了静态 token：客户端须提供匹配静态 token 或有效短期令牌，否则 401；
+        #   2) 未配静态 token 但要求令牌（websocket_requires_token）：仅接受有效短期令牌；
+        #   3) 完全开放：若客户端仍带了 token 则顺手消费（记账/吊销），不强制。
+        # 返回 None 表示放行，返回 respond(...) 表示拒绝。
         supplied = _query_first(query, "token")
         static_token = self.config.token.strip()
 
@@ -423,6 +509,11 @@ class WebSocketChannel(BaseChannel):
     # -- Server lifecycle and connection ingress ---------------------------
 
     async def start(self) -> None:
+        # 中文：启动 WebSocket 服务端。配置 unix_socket_path 时走 Unix 域套接字
+        # （适合同机/容器内部通信，权限 0600），否则走 TCP（可选 WSS/TLS）。
+        # process_request 钩子在同一端口上分流 HTTP 与 WS；handler 处理每条连接的
+        # 生命周期。runner 协程在 _stop_event 被置位前持续运行，退出时关闭服务端
+        # 并清理套接字文件。
         from nanobot.utils.logging_bridge import redirect_lib_logging
 
         redirect_lib_logging("websockets", level="WARNING")
@@ -467,6 +558,7 @@ class WebSocketChannel(BaseChannel):
         async def runner() -> None:
             socket_path = self.config.unix_socket_path
             if socket_path:
+                # Unix 域套接字：先建父目录、删除遗留套接字文件，再以 0600 权限监听
                 path_obj = Path(socket_path)
                 path_obj.parent.mkdir(parents=True, exist_ok=True)
                 with suppress(FileNotFoundError):
@@ -483,6 +575,7 @@ class WebSocketChannel(BaseChannel):
                 with suppress(OSError):
                     path_obj.chmod(0o600)
             else:
+                # TCP 监听：max_size 限制单帧大小以防范超大帧 DoS
                 server = await serve(
                     handler,
                     self.config.host,
