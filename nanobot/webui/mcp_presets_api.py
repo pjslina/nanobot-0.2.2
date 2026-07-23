@@ -1,4 +1,11 @@
-"""MCP preset helpers for the WebUI settings and message surfaces."""
+"""MCP preset helpers for the WebUI settings and message surfaces.
+
+本模块为 WebUI 设置页与消息面提供 MCP（Model Context Protocol）服务器预设的全部
+CRUD 逻辑：维护一组内置预设（`MCP_PRESETS`），将 WebUI 提交的查询参数物化为
+`MCPServerConfig` 并持久化到 `~/.nanobot/config.json`，同时产出供前端渲染的状态与
+manifest。此外还支持自定义服务器、从外部 JSON（如 Cursor 配置）导入、连接测试以及
+配置变更后的热重载通知。所有动作返回带 `last_action` 的统一 payload，便于前端展示结果。
+"""
 
 from __future__ import annotations
 
@@ -25,15 +32,19 @@ from nanobot.utils.helpers import ensure_dir
 
 QueryParams = dict[str, list[str]]
 
+# 预设名合法字符：小写字母/数字开头，仅含字母数字、下划线、短横线，最长 64 字符
 _MCP_PRESET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$", re.IGNORECASE)
+# 匹配 URL 查询串中形如 ?api_key=xxx / &token=xxx 的敏感参数，捕获组 1 保留键名用于脱敏
 _SECRET_QUERY_RE = re.compile(
     r"([?&](?:[^=&]*(?:api[_-]?key|token|secret|password|bearer)[^=&]*)=)[^&#\s]+",
     re.IGNORECASE,
 )
+# 匹配命令行/文本中形如 api_key=xxx / token:xxx 的敏感赋值，捕获组 1 保留前缀用于脱敏
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"((?:api[_-]?key|token|secret|password|bearer)(?:[=:]|\s+))[^,\s'\"&]+",
     re.IGNORECASE,
 )
+# 消息附件中允许携带的预设元数据键名（首个 "name" 单独处理，作为主键）
 _MCP_ATTACHMENT_KEYS = (
     "name",
     "display_name",
@@ -47,13 +58,17 @@ _MCP_ATTACHMENT_KEYS = (
 _MAX_TEST_TOOLS = 16
 _DEFAULT_TEST_TIMEOUT = 20
 _DEFAULT_CUSTOM_TIMEOUT = 30
+# 走自定义服务器处理路径的 action 集合（与内置预设的 enable/remove/test 区分）
 _CUSTOM_ACTIONS = {"custom", "import", "import-cursor", "tools"}
 
 McpReload = Callable[[], Awaitable[dict[str, Any]]]
 
 
 class McpPresetError(Exception):
-    """WebUI-facing MCP preset error."""
+    """WebUI-facing MCP preset error.
+
+    面向 WebUI 的 MCP 预设异常，携带 HTTP 状态码。调用方据此返回对应的 HTTP 响应，
+    而非抛出通用 500。`status` 默认 400（请求参数错误）。"""
 
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -65,15 +80,23 @@ class McpPresetError(Exception):
 class McpPresetField:
     name: str
     label: str
+    # target 为 (写入位置, 目标键) 二元组：值会被注入到 env、URL 查询参数、命令行参数或 HTTP 头
     target: tuple[Literal["env", "url_param", "arg", "header"], str]
     secret: bool = True
     required: bool = True
+    # 对应的进程环境变量名：当配置中缺失时，可回退读取该环境变量判断是否已"配置"
     env_var: str | None = None
     placeholder: str = ""
 
 
 @dataclass(frozen=True)
 class McpPreset:
+    """单个内置 MCP 预设的静态定义。
+
+    描述一个可一键启用的 MCP 服务器模板：传输方式、品牌信息、所需凭据字段以及默认
+    `MCPServerConfig`。`fields` 定义用户需填写的凭据，`_materialize_server` 会据此把
+    用户输入注入到克隆出的 `server` 配置中。"""
+
     name: str
     display_name: str
     category: str
@@ -414,13 +437,16 @@ def _known_preset_names() -> set[str]:
 
 
 def _known_mcp_names() -> set[str]:
+    """返回内置预设名与已配置服务器名的并集，用于校验 WebUI 提及的预设是否合法。"""
     names = _known_preset_names()
+    # 读取配置失败时静默忽略，仅返回内置预设名，避免拖垮整条消息处理流程
     with suppress(Exception):
         names.update(load_config().tools.mcp_servers)
     return names
 
 
 def _clip_ws_string(value: Any, limit: int = 240) -> str | None:
+    """裁剪字符串首尾空白并截断到 `limit`，空值返回 None。用于规整 WebUI 传入的可疑文本。"""
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -430,7 +456,10 @@ def _clip_ws_string(value: Any, limit: int = 240) -> str | None:
 
 
 def normalize_mcp_preset_mentions(raw: Any) -> list[dict[str, Any]]:
-    """Sanitize structured MCP preset mentions sent by the WebUI."""
+    """Sanitize structured MCP preset mentions sent by the WebUI.
+
+    清洗 WebUI 在消息附件中提交的 MCP 预设提及：仅保留已知名、去重、限制条数与字段，
+    防止前端注入任意键或过长文本。最多保留 8 条，每个字段按类型截断。"""
     if not isinstance(raw, list):
         return []
     known = _known_mcp_names()
@@ -443,15 +472,18 @@ def normalize_mcp_preset_mentions(raw: Any) -> list[dict[str, Any]]:
         if not name or _MCP_PRESET_NAME_RE.match(name) is None:
             continue
         key = name.lower()
+        # 跳过重复名与未知名：提及必须对得上某个内置预设或已配置服务器
         if key in seen or key not in known:
             continue
         seen.add(key)
         row: dict[str, Any] = {"name": key}
+        # 跳过首个 "name"，逐个提取并截断其余元数据字段
         for field_name in _MCP_ATTACHMENT_KEYS[1:]:
             value = item.get(field_name)
             if isinstance(value, bool):
                 row[field_name] = value
                 continue
+            # logo_url 允许更长，其余字段限制 160 字符
             limit = 512 if field_name == "logo_url" else 160
             text = _clip_ws_string(value, limit)
             if text:
@@ -461,20 +493,29 @@ def normalize_mcp_preset_mentions(raw: Any) -> list[dict[str, Any]]:
 
 
 def _clone_server(server: MCPServerConfig) -> MCPServerConfig:
+    """深拷贝一个 `MCPServerConfig`：经 JSON 序列化再校验，确保后续修改不影响原预设。"""
     return MCPServerConfig.model_validate(server.model_dump(mode="json"))
 
 
 def _with_managed_stdio_cwd(name: str, cfg: MCPServerConfig) -> MCPServerConfig:
+    """为 stdio 型 MCP 服务器指定受管工作目录（`runtime/mcp/<name>`）。
+
+    每个预设的本地进程在独立的运行时子目录下运行，便于卸载时统一清理。仅当未显式设置
+    `cwd` 时才填充。"""
     if cfg.command and (cfg.type in (None, "stdio")) and not cfg.cwd:
         cfg.cwd = str(ensure_dir(get_runtime_subdir("mcp") / name))
     return cfg
 
 
 def _remove_managed_stdio_cwd(name: str, cfg: MCPServerConfig | None) -> bool:
+    """删除预设的受管工作目录，仅当该目录确实由 `_with_managed_stdio_cwd` 创建时生效。
+
+    通过将实际 `cwd` 解析后与 `runtime/mcp/<name>` 比对，避免误删用户自定义目录。"""
     if cfg is None or not cfg.cwd:
         return False
     cwd = Path(cfg.cwd).expanduser().resolve(strict=False)
     managed = (get_runtime_subdir("mcp") / name).resolve(strict=False)
+    # 不是受管目录或已不存在则跳过，保证只清理我们创建的内容
     if cwd != managed or not cwd.exists():
         return False
     if cwd.is_symlink() or cwd.is_file():
@@ -485,6 +526,7 @@ def _remove_managed_stdio_cwd(name: str, cfg: MCPServerConfig | None) -> bool:
 
 
 def _url_with_param(url: str, key: str, value: str) -> str:
+    """将 URL 查询参数 `key` 替换/追加为 `value`：先剔除已有同名参数再追加，避免重复键。"""
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query = [(k, v) for k, v in query if k != key]
@@ -501,6 +543,7 @@ def _url_with_param(url: str, key: str, value: str) -> str:
 
 
 def _arg_value(args: list[str], flag: str) -> str | None:
+    """从命令行参数列表中读取 `flag` 的值，支持 `--flag value` 与 `--flag=value` 两种形式。"""
     prefix = f"{flag}="
     for index, item in enumerate(args):
         if item == flag and index + 1 < len(args):
@@ -511,6 +554,8 @@ def _arg_value(args: list[str], flag: str) -> str | None:
 
 
 def _with_arg_value(args: list[str], flag: str, value: str) -> list[str]:
+    """返回新的参数列表：先剔除 `flag` 的所有既有出现（含空格分隔与等号形式），再追加
+    `flag value`。用 `skip_next` 跳过空格分隔形式中紧随其后的值。"""
     out: list[str] = []
     skip_next = False
     prefix = f"{flag}="
@@ -529,6 +574,7 @@ def _with_arg_value(args: list[str], flag: str, value: str) -> list[str]:
 
 
 def _field_value_from_config(field: McpPresetField, cfg: MCPServerConfig | None) -> str | None:
+    """根据字段的 `target` 类型，从已有配置中读取该凭据的当前值（env/header/arg/url_param）。"""
     if cfg is None:
         return None
     target_kind, target_name = field.target
@@ -549,6 +595,7 @@ def _field_value_from_config(field: McpPresetField, cfg: MCPServerConfig | None)
 
 
 def _field_configured(field: McpPresetField, cfg: MCPServerConfig | None) -> bool:
+    """判断字段是否"已配置"：配置中有值即可；否则回退检查同名进程环境变量。"""
     value = _field_value_from_config(field, cfg)
     if value:
         return True
@@ -572,6 +619,10 @@ def _resolve_field_value(
     query: QueryParams,
     existing: MCPServerConfig | None,
 ) -> str | None:
+    """按优先级解析字段值：WebUI 提交值 > 已有配置值 > 环境变量占位符。
+
+    当仅环境变量存在时返回 `${VAR}` 占位形式，由配置加载器 `resolve_config_env_vars`
+    在运行时展开，避免把真实凭据写入配置文件。"""
     provided = _query_value(query, field.name)
     if provided:
         return provided
@@ -588,6 +639,10 @@ def _materialize_server(
     query: QueryParams,
     existing: MCPServerConfig | None,
 ) -> MCPServerConfig:
+    """根据预设模板与 WebUI 输入，构造可持久化的 `MCPServerConfig`。
+
+    核心流程：克隆预设默认配置 -> 逐字段解析值并按 `target` 注入到 env/header/args/url ->
+    为 stdio 服务器设置受管工作目录。必填字段缺失时抛出 400 错误。"""
     if preset.server is None or not preset.install_supported:
         raise McpPresetError(f"{preset.display_name} is not supported yet", status=409)
 
@@ -611,6 +666,7 @@ def _materialize_server(
 
 
 def _command_available(command: str) -> bool:
+    """检查命令是否可用：先在 PATH 中查找，再尝试作为文件路径是否存在。"""
     if not command:
         return False
     if shutil.which(command):
@@ -620,6 +676,7 @@ def _command_available(command: str) -> bool:
 
 
 def _config_available(cfg: MCPServerConfig | None) -> bool:
+    """判断服务器配置"可用"：stdio 型看命令是否存在，远程型只要有 URL 即视为可用。"""
     if cfg is None:
         return False
     if cfg.command:
@@ -630,6 +687,9 @@ def _config_available(cfg: MCPServerConfig | None) -> bool:
 
 
 def _status_for(preset: McpPreset, cfg: MCPServerConfig | None) -> str:
+    """计算预设在前端展示的状态字符串（驱动 UI 徽标）。
+
+    优先级：未安装 -> 缺凭据 -> 缺依赖 -> 已配置。缺凭据判定会回退检查环境变量。"""
     if cfg is None:
         return "not_installed" if preset.install_supported else "coming_soon"
     if any(field.required and not _field_configured(field, cfg) for field in preset.fields):
@@ -640,29 +700,34 @@ def _status_for(preset: McpPreset, cfg: MCPServerConfig | None) -> str:
 
 
 def _connection_summary(cfg: MCPServerConfig | None) -> str:
+    """生成人类可读的连接摘要：stdio 取命令+前两个参数，远程型取去查询串的 URL。"""
     if cfg is None:
         return ""
     if cfg.command:
         return " ".join([cfg.command, *cfg.args[:2]]).strip()
     if cfg.url:
         parsed = urllib.parse.urlsplit(cfg.url)
+        # 仅保留 scheme/netloc/path，丢弃查询串以避免泄露凭据
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return ""
 
 
 def _tool_allowlist(cfg: MCPServerConfig | None) -> list[str]:
+    """返回启用的工具白名单：未配置时默认 `["*"]`（全部启用）。"""
     if cfg is None:
         return ["*"]
     return list(cfg.enabled_tools)
 
 
 def _managed_mcp_path(name: str, cfg: MCPServerConfig | None) -> list[str]:
+    """返回该预设受管路径标识列表：仅 stdio 型有运行时目录，远程型返回空。"""
     if cfg is None or not cfg.command:
         return []
     return [f"runtime:mcp/{name}"]
 
 
 def _preset_manifest(preset: McpPreset, *, logo_url: str) -> dict[str, Any]:
+    """构建内置预设的 app manifest（统一的应用描述结构），供前端展示安装/卸载能力与信任级别。"""
     server = preset.server
     managed_paths = _managed_mcp_path(preset.name, server)
     field_specs = [
@@ -716,6 +781,8 @@ def _preset_manifest(preset: McpPreset, *, logo_url: str) -> dict[str, Any]:
 
 
 def _custom_manifest(name: str, cfg: MCPServerConfig) -> dict[str, Any]:
+    """构建用户自定义 MCP 服务器的 app manifest。无受管路径（不清理运行时目录），
+    信任级别为 `user`，与内置预设的 `builtin` 区分。"""
     transport = cfg.type or ("stdio" if cfg.command else "streamableHttp")
     managed_paths: list[str] = []
     return app_manifest(
@@ -754,8 +821,10 @@ def _custom_manifest(name: str, cfg: MCPServerConfig) -> dict[str, Any]:
 
 
 def _preset_payload(preset: McpPreset, configured_servers: dict[str, MCPServerConfig]) -> dict[str, Any]:
+    """构建单个内置预设的完整前端 payload：状态、凭据字段、连接摘要、工具白名单与 manifest。"""
     cfg = configured_servers.get(preset.name)
     status = _status_for(preset, cfg)
+    # "已配置"判定：配置存在且非缺凭据状态（缺依赖也算已配置，仅凭据未填不算）
     configured = cfg is not None and status not in {"missing_credentials"}
     logo_url = _favicon_url(preset.brand_domain)
     return {
@@ -788,6 +857,8 @@ def _custom_payload(
     *,
     tool_names: list[str] | None = None,
 ) -> dict[str, Any]:
+    """构建用户自定义服务器的 payload。传输方式缺省时按 URL 后缀推断（`/sse` -> sse，
+    否则 streamableHttp），状态仅区分缺依赖与已配置。"""
     transport = cfg.type
     if not transport:
         transport = "stdio" if cfg.command else ("sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp")
@@ -822,6 +893,10 @@ def mcp_presets_payload(
     last_action: dict[str, Any] | None = None,
     tool_preview: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Any]:
+    """构建 MCP 设置页的主 payload：合并内置预设行与自定义服务器行，附安装计数与上次动作结果。
+
+    自定义行通过 `name not in known` 过滤掉与内置预设同名的条目，避免重复展示。
+    `tool_preview` 提供最近一次测试得到的工具名预览，按名注入对应行。"""
     config = load_config()
     known = _known_preset_names()
     preset_rows = [
@@ -848,6 +923,8 @@ def _display_name_for(name: str, preset: McpPreset | None = None) -> str:
 
 
 def _action_message(action: str, preset: McpPreset, *, ok: bool = True) -> dict[str, Any]:
+    """构建内置预设动作的 `last_action` 消息，含 `verification` 数组告知前端应校验的状态
+    （enable -> config_present，remove -> config_absent）。"""
     verb = {
         "enable": "Enabled",
         "remove": "Removed",
@@ -867,6 +944,7 @@ def _action_message(action: str, preset: McpPreset, *, ok: bool = True) -> dict[
 
 
 def _server_action_message(action: str, name: str, *, ok: bool = True) -> dict[str, Any]:
+    """构建自定义服务器动作的 `last_action` 消息，语义同 `_action_message` 但面向自定义服务器。"""
     verb = {
         "custom": "Saved",
         "import": "Imported",
@@ -888,28 +966,37 @@ def _server_action_message(action: str, name: str, *, ok: bool = True) -> dict[s
 
 
 def _scrub_test_error(text: str) -> str:
+    """从测试错误信息中脱敏：用预定义正则把 API key/token 等敏感值替换为 `<redacted>`，
+    再截断到 400 字符，避免凭据经错误信息泄露到前端。"""
     scrubbed = _SECRET_QUERY_RE.sub(r"\1<redacted>", text.strip())
     scrubbed = _SECRET_ASSIGNMENT_RE.sub(r"\1<redacted>", scrubbed)
     return scrubbed[:400] if scrubbed else "Connection failed."
 
 
 def _checked_at() -> str:
+    """返回 UTC 时间戳的 ISO 8601 字符串（用 `Z` 后缀代替 `+00:00`，前端友好）。"""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _test_timeout(cfg: MCPServerConfig) -> int:
+    """计算测试连接的超时：取配置值或默认 20s，并钳制在 [5, 20] 区间内。"""
     raw = cfg.tool_timeout or _DEFAULT_TEST_TIMEOUT
     return max(5, min(int(raw), _DEFAULT_TEST_TIMEOUT))
 
 
 async def _close_mcp_stacks(stacks: Mapping[str, Any]) -> None:
+    """逐一关闭 MCP 连接栈，忽略单个关闭异常以保证全部清理。"""
     for stack in stacks.values():
         with suppress(Exception):
             await stack.aclose()
 
 
 async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
-    """Connect to an enabled MCP preset and report its tool surface."""
+    """Connect to an enabled MCP preset and report its tool surface.
+
+    执行连接测试：解析环境变量占位 -> 预检凭据/依赖 -> 在超时内尝试 MCP 握手 ->
+    采集注册表中以 `mcp_<name>_` 为前缀的工具名。任何失败都返回带 `last_action` 的
+    payload（而非抛异常），便于前端在设置页内联展示结果。"""
     from nanobot.agent.tools.mcp import connect_mcp_servers
 
     name = (_query_first(query, "name") or "").strip()
@@ -921,6 +1008,7 @@ async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
     display_name = _display_name_for(name, preset)
 
     try:
+        # 展开配置中的 `${VAR}` 占位符为真实环境变量值，供测试连接直接使用
         config = resolve_config_env_vars(load_config())
     except ValueError as exc:
         return mcp_presets_payload(last_action={
@@ -936,6 +1024,7 @@ async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
     if cfg is None:
         raise McpPresetError(f"{display_name} is not enabled", status=404)
 
+    # 自定义服务器无预设定义，单独判定缺依赖状态
     status = _status_for(preset, cfg) if preset is not None else (
         "missing_dependency" if cfg.command and not _command_available(cfg.command) else "configured"
     )
@@ -968,6 +1057,7 @@ async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
             connect_mcp_servers({name: cfg}, registry),
             timeout=_test_timeout(cfg),
         )
+        # MCP 工具注册时统一加 `mcp_<name>_` 前缀，据此筛出本服务器暴露的工具
         tool_prefix = f"mcp_{name}_"
         tool_names = sorted(name for name in registry.tool_names if name.startswith(tool_prefix))
         ok = name in stacks
@@ -1019,6 +1109,7 @@ async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
 
 
 def _parse_json_value(raw: str | None, *, fallback: Any) -> Any:
+    """解析 JSON 字符串；空输入返回 `fallback`，解析失败抛 McpPresetError。"""
     if raw is None or not raw.strip():
         return fallback
     try:
@@ -1028,6 +1119,8 @@ def _parse_json_value(raw: str | None, *, fallback: Any) -> Any:
 
 
 def _parse_string_list(raw: str | None) -> list[str]:
+    """解析字符串列表：JSON 数组优先；若是纯字符串则用 `shlex.split` 按 shell 规则拆分
+    （兼容 `--foo bar --baz=qux` 形式的命令行参数）。"""
     if raw is None or not raw.strip():
         return []
     parsed = _parse_json_value(raw, fallback=None)
@@ -1039,6 +1132,7 @@ def _parse_string_list(raw: str | None) -> list[str]:
 
 
 def _parse_string_map(raw: str | None) -> dict[str, str]:
+    """解析 JSON 对象为 string->string 映射，键值非字符串或非对象均报错，空键被丢弃。"""
     parsed = _parse_json_value(raw, fallback={})
     if not isinstance(parsed, dict):
         raise McpPresetError("expected a JSON object")
@@ -1052,6 +1146,7 @@ def _parse_string_map(raw: str | None) -> dict[str, str]:
 
 
 def _parse_enabled_tools(raw: str | None) -> list[str]:
+    """解析工具白名单：含 `*` 即视为全部启用（归一化为 `["*"]`），否则返回具体工具名列表。"""
     if raw is None or not raw.strip():
         return ["*"]
     values = _parse_string_list(raw)
@@ -1061,6 +1156,10 @@ def _parse_enabled_tools(raw: str | None) -> list[str]:
 
 
 def _normalize_transport(value: str | None, *, command: str = "", url: str = "") -> Literal["stdio", "sse", "streamableHttp"]:
+    """归一化传输类型为三种标准值之一。
+
+    显式值经别名表映射；缺省时按线索推断：有 command 推断为 stdio，URL 以 `/sse` 结尾
+    推断为 sse，否则为 streamableHttp。支持 `streamable-http`/`http` 等常见写法别名。"""
     raw = (value or "").strip()
     if not raw:
         if command:
@@ -1083,12 +1182,17 @@ def _normalize_transport(value: str | None, *, command: str = "", url: str = "")
 
 
 def _validated_server_name(name: str) -> str:
+    """校验服务器名合法性并归一化为小写。"""
     if not name or _MCP_PRESET_NAME_RE.match(name) is None:
         raise McpPresetError("invalid MCP server name")
     return name.strip().lower()
 
 
 def _custom_server_from_query(query: QueryParams) -> tuple[str, MCPServerConfig]:
+    """从 WebUI 查询参数构建自定义 `MCPServerConfig`。
+
+    校验传输方式与必填项（stdio 需 command，远程需 url），超时钳制到 [5, 600] 秒，
+    并按传输类型决定哪些字段保留（远程型清空 command/cwd，stdio 型清空 url）。"""
     name = _validated_server_name((_query_first(query, "name") or "").strip())
     command = (_query_first(query, "command") or "").strip()
     url = (_query_first(query, "url") or "").strip()
@@ -1119,11 +1223,16 @@ def _custom_server_from_query(query: QueryParams) -> tuple[str, MCPServerConfig]
 
 
 def _mcp_server_config(name: str, raw: Any) -> tuple[str, MCPServerConfig]:
+    """从导入 JSON 中的单个服务器对象构建 `MCPServerConfig`。
+
+    兼容 camelCase 与 snake_case 键名（`enabledTools`/`enabled_tools`、`toolTimeout`/
+    `tool_timeout`），并对 args/env/headers 做严格类型校验，超时非法时回退默认值。"""
     server_name = _validated_server_name(name)
     if not isinstance(raw, Mapping):
         raise McpPresetError(f"MCP server '{server_name}' must be an object")
     command = str(raw.get("command") or "").strip()
     url = str(raw.get("url") or "").strip()
+    # 同时接受 `type` 与 `transport` 两种键名
     transport_value = str(raw.get("type", raw.get("transport", "")) or "")
     transport = _normalize_transport(transport_value, command=command, url=url)
     if transport == "stdio" and not command:
@@ -1134,6 +1243,7 @@ def _mcp_server_config(name: str, raw: Any) -> tuple[str, MCPServerConfig]:
     env = raw.get("env") or {}
     headers = raw.get("headers") or {}
     cwd = str(raw.get("cwd") or "").strip()
+    # 兼容 camelCase 与 snake_case 两类键名
     enabled_tools = raw.get("enabledTools", raw.get("enabled_tools", ["*"]))
     tool_timeout = raw.get("toolTimeout", raw.get("tool_timeout", _DEFAULT_CUSTOM_TIMEOUT))
     try:
@@ -1146,6 +1256,7 @@ def _mcp_server_config(name: str, raw: Any) -> tuple[str, MCPServerConfig]:
         raise McpPresetError(f"MCP server '{server_name}' env must be a string object")
     if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
         raise McpPresetError(f"MCP server '{server_name}' headers must be a string object")
+    # enabled_tools 类型异常时宽容回退为全部启用，避免导入因小错中断
     if not isinstance(enabled_tools, list) or not all(isinstance(item, str) for item in enabled_tools):
         enabled_tools = ["*"]
     return server_name, MCPServerConfig(
@@ -1162,6 +1273,10 @@ def _mcp_server_config(name: str, raw: Any) -> tuple[str, MCPServerConfig]:
 
 
 def _import_mcp_servers(raw_json: str | None) -> dict[str, MCPServerConfig]:
+    """解析导入的 JSON 配置（兼容 Claude Desktop / Cursor 等格式）。
+
+    接受顶层为 `{"mcpServers": {...}}` 或直接为服务器映射的结构，逐项经
+    `_mcp_server_config` 校验后返回。空配置视为错误。"""
     parsed = _parse_json_value(raw_json, fallback=None)
     if not isinstance(parsed, Mapping):
         raise McpPresetError("MCP config must be a JSON object")
@@ -1180,6 +1295,10 @@ def _import_mcp_servers(raw_json: str | None) -> dict[str, MCPServerConfig]:
 
 
 def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
+    """处理自定义 MCP 服务器的动作（保存/导入/更新工具白名单）。
+
+    所有写操作都会 `save_config` 并标记 `requires_restart=True`，提示前端需重启或热重载
+    才能让 agent 感知新配置。"""
     config = load_config()
     if action == "custom":
         name, cfg = _custom_server_from_query(query)
@@ -1191,6 +1310,7 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
 
     if action in {"import", "import-cursor"}:
         servers = _import_mcp_servers(_query_first(query, "config"))
+        # update 合并而非替换，保留已有服务器
         config.tools.mcp_servers.update(servers)
         save_config(config)
         payload = mcp_presets_payload(last_action={
@@ -1216,6 +1336,10 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
 
 
 def mcp_presets_action(action: str, query: QueryParams) -> dict[str, Any]:
+    """处理内置预设的 enable/remove 动作（test 由异步入口单独处理）。
+
+    enable: 物化预设配置写入 config；remove: 删除配置并清理受管运行时目录，
+    清理失败会标记 `verification_failed` 但不阻断删除。"""
     name = (_query_first(query, "name") or "").strip()
     if not name:
         raise McpPresetError("missing MCP preset name")
@@ -1241,6 +1365,7 @@ def mcp_presets_action(action: str, query: QueryParams) -> dict[str, Any]:
         if name in config.tools.mcp_servers:
             existing_cfg = config.tools.mcp_servers[name]
             try:
+                # 先清理受管运行时目录再删配置：清理失败不阻断删除，仅记录错误
                 removed_runtime_files = _remove_managed_stdio_cwd(name, existing_cfg)
             except OSError as exc:
                 cleanup_error = str(exc)
@@ -1275,7 +1400,10 @@ def attach_mcp_hot_reload_result(
     payload: dict[str, Any],
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Merge an agent MCP reload acknowledgement into a WebUI settings payload."""
+    """Merge an agent MCP reload acknowledgement into a WebUI settings payload.
+
+    将 agent 侧 MCP 热重载的回执合并进设置 payload：用回执覆盖 `requires_restart`，
+    拼接回执消息到 `last_action.message`，并在缺失 `ok` 时以回执结果填充。"""
     payload = dict(payload)
     payload["hot_reload"] = result
     payload["requires_restart"] = bool(result.get("requires_restart"))
@@ -1298,7 +1426,10 @@ async def mcp_presets_settings_action(
     *,
     reload_mcp: McpReload | None = None,
 ) -> dict[str, Any]:
-    """Run a WebUI MCP preset action and hot-reload the agent when config changes."""
+    """Run a WebUI MCP preset action and hot-reload the agent when config changes.
+
+    设置页统一异步入口：分发 test/自定义/预设动作。同步写配置动作用 `asyncio.to_thread`
+    包裹避免阻塞事件循环；若提供 `reload_mcp` 回调则在配置变更后触发 agent 热重载并合并回执。"""
     if action is None:
         return mcp_presets_payload()
     if action == "test":

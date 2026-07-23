@@ -1,4 +1,11 @@
-"""Workspace-scoped token usage telemetry for WebUI overview surfaces."""
+"""Workspace-scoped token usage telemetry for WebUI overview surfaces.
+
+工作区级别的 token 用量统计，按本地日期聚合并持久化到 ``token-usage.json``。
+``TokenUsageHook`` 在 agent 每轮迭代后采集 provider 上报的用量，
+``token_usage_payload`` 为 WebUI 概览页汇总最近 30/365 天的总量、峰值与连续
+使用天数等指标。写入采用临时文件 + ``fsync`` 的原子落盘，读取带体积保护，
+避免损坏文件影响网关。
+"""
 
 from __future__ import annotations
 
@@ -17,7 +24,9 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.config.paths import get_webui_dir
 
 TOKEN_USAGE_SCHEMA_VERSION = 1
+# 状态文件最大字节数，超过则视为异常并忽略，防止损坏/超大文件拖垮读取。
 _MAX_STATE_FILE_BYTES = 512 * 1024
+# 最多保留的天数，超出时按日期排序裁剪最旧的记录。
 _MAX_DAYS_RETAINED = 400
 _USAGE_KEYS = (
     "prompt_tokens",
@@ -28,7 +37,9 @@ _USAGE_KEYS = (
     "estimated_tokens",
 )
 _REQUEST_KEYS = ("requests", "provider_requests", "estimated_requests")
+# 用量来源分类：user=对话、api=HTTP API、cron=定时任务、dream=记忆整理、system=系统。
 _SOURCE_KEYS = ("user", "api", "cron", "dream", "system")
+# 写入串行化锁，避免并发记录相互覆盖。
 _WRITE_LOCK = threading.Lock()
 
 
@@ -49,6 +60,7 @@ def _utc_now_iso() -> str:
 
 
 def _zone(timezone_name: str | None) -> timezone | ZoneInfo:
+    # 解析时区名，无效或缺失时回退到 UTC，保证按本地日聚合时不报错。
     if not timezone_name:
         return timezone.utc
     try:
@@ -58,6 +70,7 @@ def _zone(timezone_name: str | None) -> timezone | ZoneInfo:
 
 
 def _local_day(now: datetime | None = None, *, timezone_name: str | None = None) -> str:
+    # 将时刻转换到指定时区后取日期，用于把用量归入用户当地的"自然日"。
     dt = now or datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -76,6 +89,7 @@ def _clean_source(value: str | None) -> str:
 
 
 def _source_from_session_key(session_key: str | None) -> str:
+    # 按 session key 前缀推断用量来源，用于在 hook 中自动归类而非依赖显式传入。
     key = session_key or ""
     if key.startswith("dream:"):
         return "dream"
@@ -92,15 +106,19 @@ def _normalize_usage(raw: dict[str, Any] | None) -> dict[str, int]:
     if not isinstance(raw, dict):
         return {}
     usage = {key: _clean_int(raw.get(key)) for key in _USAGE_KEYS}
+    # total 缺失时用 prompt+completion 兜底，保证总有可展示的总量。
     fallback_total = usage["prompt_tokens"] + usage["completion_tokens"]
     if usage["total_tokens"] <= 0:
         usage["total_tokens"] = fallback_total
+    # provider_tokens 与 estimated_tokens 互为兜底：分别代表"真实计费"与"估算"两类口径，
+    # 只在缺失时用 total 补齐，且不得超过 total，避免双计数。
     if usage["estimated_tokens"] <= 0 and usage["provider_tokens"] <= 0:
         usage["provider_tokens"] = usage["total_tokens"]
     elif usage["estimated_tokens"] > 0 and usage["provider_tokens"] <= 0:
         usage["estimated_tokens"] = min(usage["estimated_tokens"], usage["total_tokens"])
     elif usage["provider_tokens"] > 0 and usage["estimated_tokens"] <= 0:
         usage["provider_tokens"] = min(usage["provider_tokens"], usage["total_tokens"])
+    # 没有任何 token 则视为无效记录，返回空以便调用方跳过。
     return usage if usage["total_tokens"] > 0 else {}
 
 
@@ -111,6 +129,8 @@ def _normalize_usage_row(row: dict[str, Any]) -> dict[str, int]:
     if cleaned["provider_tokens"] <= 0 and cleaned["estimated_tokens"] <= 0:
         cleaned["provider_tokens"] = cleaned["total_tokens"]
     requests = {key: _clean_int(row.get(key)) for key in _REQUEST_KEYS}
+    # 请求次数同样在 provider/estimated 两类间兜底：依据 token 口径决定归入哪一类，
+    # 使请求计数与 token 计数的口径保持一致。
     if (
         requests["requests"] > 0
         and requests["provider_requests"] <= 0
@@ -133,12 +153,14 @@ def _normalize_sources(raw: Any, fallback: dict[str, int]) -> dict[str, dict[str
             if normalized["total_tokens"] <= 0 and normalized["requests"] <= 0:
                 continue
             source_key = _clean_source(str(source))
+            # 同一分区可能出现多次（历史数据），累加而非覆盖。
             current = sources.get(source_key)
             if current is None:
                 sources[source_key] = normalized
             else:
                 for key in (*_USAGE_KEYS, *_REQUEST_KEYS):
                     current[key] = _clean_int(current.get(key)) + normalized[key]
+    # 缺失来源细分时，把整行用量归入 user 分区，保证总有来源维度可用。
     if not sources and (fallback["total_tokens"] > 0 or fallback["requests"] > 0):
         sources["user"] = {key: fallback[key] for key in (*_USAGE_KEYS, *_REQUEST_KEYS)}
     return sources
@@ -153,6 +175,7 @@ def normalize_token_usage_state(raw: Any) -> dict[str, Any]:
         return state
 
     days: dict[str, dict[str, Any]] = {}
+    # 按日期排序后只保留最近 _MAX_DAYS_RETAINED 天，丢弃超期记录实现滚动清理。
     for date, row in sorted(days_raw.items())[-_MAX_DAYS_RETAINED:]:
         if not isinstance(date, str) or len(date) != 10 or not isinstance(row, dict):
             continue
@@ -176,6 +199,7 @@ def read_token_usage_state() -> dict[str, Any]:
     if not path.is_file():
         return default_token_usage_state()
     try:
+        # 体积超限直接放弃读取，防止异常文件阻塞或污染内存。
         if path.stat().st_size > _MAX_STATE_FILE_BYTES:
             logger.warning("token usage state too large, ignoring: {}", path)
             return default_token_usage_state()
@@ -201,6 +225,7 @@ def write_token_usage_state(raw: dict[str, Any]) -> dict[str, Any]:
 
     path = token_usage_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 原子写入：先写临时文件并 fsync 数据，再 os.replace 原子替换，避免崩溃产生半写文件。
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "wb") as f:
         f.write(encoded)
@@ -208,6 +233,7 @@ def write_token_usage_state(raw: dict[str, Any]) -> dict[str, Any]:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    # 同步目录元数据，确保 replace 操作本身落盘（Linux 需要，Windows 上尽力而为）。
     try:
         dir_fd = os.open(path.parent, os.O_RDONLY)
     except OSError:
@@ -228,6 +254,7 @@ def record_token_usage(
 ) -> dict[str, Any]:
     normalized = _normalize_usage(usage)
     if not normalized:
+        # 无有效用量则不记录，直接返回当前状态。
         return read_token_usage_state()
 
     with _WRITE_LOCK:
@@ -237,6 +264,8 @@ def record_token_usage(
         for key in _USAGE_KEYS:
             row[key] = _clean_int(row.get(key)) + normalized.get(key, 0)
         row["requests"] = _clean_int(row.get("requests")) + 1
+        # 请求计数按 token 口径分流到 provider_requests 或 estimated_requests，
+        # 与 _normalize_usage_row 的兜底逻辑保持一致。
         if normalized.get("estimated_tokens", 0) > 0 and normalized.get("provider_tokens", 0) <= 0:
             row["estimated_requests"] = _clean_int(row.get("estimated_requests")) + 1
         else:
@@ -256,6 +285,7 @@ def record_token_usage(
         row["sources"] = sources
 
         state["days"][day] = row
+        # 超出保留窗口时裁剪最旧的天，维持文件体积上限。
         if len(state["days"]) > _MAX_DAYS_RETAINED:
             kept = dict(sorted(state["days"].items())[-_MAX_DAYS_RETAINED:])
             state["days"] = kept
@@ -268,6 +298,7 @@ def record_response_token_usage(
     source: str,
     timezone_name: str | None = None,
 ) -> None:
+    # 从 provider 响应对象提取 usage 并记录；任何异常都吞掉只记日志，不影响主流程。
     try:
         record_token_usage(
             getattr(response, "usage", None),
@@ -309,12 +340,14 @@ def token_usage_payload(
         for date, row in state["days"].items()
         if _clean_int(row.get("total_tokens")) > 0
     }
+    # 当前连续使用天数：从今天起向前回溯，遇到无用量的一天即停止。
     current_streak = 0
     cursor = today
     while cursor in active_dates:
         current_streak += 1
         cursor -= timedelta(days=1)
 
+    # 最长连续使用天数：按日期顺序遍历所有活跃日，与前一天相邻则累加，否则重置为 1。
     longest_streak = 0
     running_streak = 0
     for cursor in sorted(active_dates):
@@ -340,13 +373,18 @@ def token_usage_payload(
 
 
 class TokenUsageHook(AgentHook):
-    """Persist provider-reported token usage without coupling it to chat messages."""
+    """Persist provider-reported token usage without coupling it to chat messages.
+
+    作为 ``AgentHook`` 注入 agent 循环，在每轮迭代结束后采集 ``context.usage``
+    并按 session key 自动归类来源后落盘。用量统计与聊天消息解耦，即使无出站
+    消息也能记录消耗。"""
 
     def __init__(self, *, timezone_name: str | None = None) -> None:
         super().__init__()
         self._timezone_name = timezone_name
 
     async def after_iteration(self, context: AgentHookContext) -> None:
+        # 记录失败仅记日志，不影响 agent 主循环。
         try:
             record_token_usage(
                 context.usage,
